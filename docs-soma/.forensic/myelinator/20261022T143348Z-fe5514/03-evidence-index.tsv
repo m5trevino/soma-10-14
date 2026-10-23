@@ -1,0 +1,17 @@
+ID	Host	Kind	Locator	Captured At	Proves	Confidence
+E-001	flintx	source	`soma/myelinator_olc.py`	2026-10-22T14:33Z	Primary file exists, 309 lines, class at line 27	C1
+E-002	flintx	source	`soma-grok/soma/myelinator_olc.py`	2026-10-22T14:33Z	Duplicate exists, identical size, newer mtime	C1
+E-003	flintx	source	`soma/myelinator_olc.py:40`	2026-10-22T14:33Z	PIN generation via `secrets.randbelow(10000)`	C1
+E-004	flintx	source	`soma/myelinator_olc.py:43-44`	2026-10-22T14:33Z	PIN hashing via `hashlib.sha256()`	C1
+E-005	flintx	source	`soma/store.py:75-128`	2026-10-22T14:33Z	Soma CRUD methods: create_node, delete_node, query_by_type, create_edge, get_edges	C1
+E-006	flintx	source	`soma/myelinator_olc.py:194-196`, `soma/pipeline/llm_sdk.py:29`	2026-10-22T14:33Z	LLM call path with stage mapping "myelinator"→"olc"	C1
+E-007	flintx	source	`soma/pipeline/drafter_dendrite.py:178-189`	2026-10-22T14:33Z	ToolRegistry stub — `call()` returns `ok=False` for all tools	C1
+E-008	flintx	source	`soma/myelinator_olc.py:59-64`	2026-10-22T14:33Z	FunctionSlot query: filtered by `session_id` property	C1
+E-009	flintx	source	`soma/myelinator_olc.py:65-68`	2026-10-22T14:33Z	InvariantQueryNode query: filtered by `session_id` property	C1
+E-010	flintx	source	`soma/myelinator_olc.py:154-161`	2026-10-22T14:33Z	SessionManifestNode creation with JSON pin_map payload	C1
+E-011	flintx	source	`soma/myelinator_olc.py:257-270`	2026-10-22T14:33Z	OptimizedSlot creation with properties including pin_hash and LINKED_TO edge	C1
+E-012	flintx	source	`soma/run_pipeline.py:162-163, 235`	2026-10-22T14:33Z	Pipeline Stage 8: instantiation, run() call, result collection	C1
+E-013	flintx	source	`soma/walk.py:52`	2026-10-22T14:33Z	Stage registration as `("myelinator", MyelinatorOptimizer)`	C1
+E-014	flintx	source	`soma/test_tb_fix_010.py:1-200`	2026-10-22T14:33Z	5 unit tests for `apply_check()`: pass, fail, missing, no-spawn, edge-unchanged	C1
+E-015	flintx	source	`soma/myelinator_olc.py:3-9`	2026-10-22T14:33Z	Hard gate declarations in module docstring	C1
+E-016	flintx	source	`soma/myelinator_olc.py:184`	2026-10-22T14:33Z	Direct `create_edge()` call bypassing ToolRegistry in deterministic matching path	C1

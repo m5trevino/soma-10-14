@@ -1,0 +1,14 @@
+ID	Host	Kind	Locator	Captured At	Proves	Confidence
+E-001	flintx	source	pipeline/receptor_dendrite.py:1-136	2026-10-22T12:28Z	ReceptorDendrite class, ReceptorOutput dataclass, strip_raw function, TB-TK-REPLACE-001 docstring	C2
+E-002	flintx	source	test_receptor_dendrite.py:1-281	2026-10-22T12:28Z	25 tests across 10 test classes importing from pipeline.receptor_dendrite	C2
+E-003	flintx	source	machinetalk/soma_bridge.py:82-103	2026-10-22T12:28Z	write_receptor() creates ReceptorLog node, upserts, creates PROCESSED_BY edge	C2
+E-004	flintx	source	soma/helpers.py:5-25	2026-10-22T12:28Z	get_receptor_config() and put_receptor_config() signatures and full logic	C2
+E-005	flintx	source	machinetalk/client.py:14-31	2026-10-22T12:28Z	_STAGE_MAP["receptor"] = "distiller" at line 16	C2
+E-006	flintx	source	machinetalk/engine.py:448-450	2026-10-22T12:28Z	Production trigger: stage=="distiller" calls self._bridge.write_receptor()	C2
+E-007	flintx	source	machinetalk/soma_bridge.py:107	2026-10-22T12:28Z	soma._persist() called after stage write	C2
+E-008	flintx	source	run_engine.py:243-250	2026-10-22T12:28Z	Secondary write_receptor call in --soma-only mode	C2
+E-009	flintx	grep	rg 'from pipeline.receptor_dendrite' = 0 non-test results	2026-10-22T12:28Z	No production import of pipeline.receptor_dendrite	C1
+E-010	flintx	source	machine-talk/*.md scan	2026-10-22T12:28Z	No tb-XXX spec for receptor in machine-talk documentation	C2
+E-011	flintx	data	output/soma.json — 60 ReceptorLog nodes	2026-10-22T12:28Z	Live data: 60 ReceptorLog nodes with full properties observed	C1
+E-012	flintx	data	output/soma.json — 0 ReceptorConfig matches	2026-10-22T12:28Z	No ReceptorConfig nodes exist in any output data	C1
+E-013	flintx	source	drafter_dendrite.py:184-189	2026-10-22T12:28Z	Drafter implements own _get_receptor_config(agent_id) with different signature	C2

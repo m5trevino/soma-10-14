@@ -1,0 +1,35 @@
+E-001	flintx	inventory	.forensic/soma/20261022T095652Z-3411e1/01-inventory.txt	2026-10-22T09:56:53Z	Target roots, file counts, newest files, entrypoint heads, config sizes	C1
+E-002	flintx	command	git -C /home/flintx/soma-10-14 rev-parse --is-inside-work-tree	2026-10-22T09:58Z	Project is not a git work tree	C1
+E-003	flintx	command	find soma -maxdepth 2 -type f -name '*.py' -printf '%TY-%Tm-%Td %TH:%TM %6s %p\n'	2026-10-22T09:58Z	Python file sizes and UTC mtimes for the soma package	C1
+E-004	flintx	command	find soma/output -maxdepth 2 -type f/-type d	2026-10-22T09:58Z	Output layout: checkpoints/stage1/artifacts/skip_vault/logs only; no stage2-4 or codebase	C1
+E-005	flintx	command	python3 -c json.load('soma/output/soma.json'); count nodes/edges/types	2026-10-22T09:58Z	997 nodes, 1 edge, ChatSet 788/TaskNode 133/ReceptorLog 60/SessionAnchor 16	C1
+E-006	flintx	source	run.sh:1-19	2026-10-22T09:58Z	Launcher dispatch: --source/--queue -> run_engine.py, else run_sessions.py; PYTHONPATH	C2
+E-007	flintx	source	run_sessions.py:45-54,208-339,341-357,621-700,1231-1330	2026-10-22T09:58Z	Launcher constants, subprocess invocation of engine, dashboard start, profile discovery, CLI	C2
+E-008	flintx	source	soma/run_engine.py:23-128,135-269	2026-10-22T09:58Z	Engine CLI, queue loader, dashboard thread, soma-only distiller path	C2
+E-009	flintx	source	soma/machinetalk/engine.py:64-102,287-532,536-656,680-945,976-1025	2026-10-22T09:58Z	AtomicSoma, stage payloads, stage1 pool, checkpoint writes, soma bridge calls, stages 2-4, run()	C2
+E-010	flintx	source	soma/machinetalk/client.py:15-36,79-120,123-181	2026-10-22T09:58Z	Stage-name map, single run_stage call, CallRecord construction, no retry loop	C2
+E-011	flintx	source	soma/machinetalk/source.py:80-171	2026-10-22T09:58Z	ChatSet assembly from chunks, canonical raw_chat_set, hash computation, session discovery	C2
+E-012	flintx	source	soma/store.py:26-135	2026-10-22T09:58Z	JSON graph store; load expects edges[].rel_type; persist writes rel_type	C2
+E-013	flintx	source	soma/machinetalk/soma_bridge.py:47-160,166-538	2026-10-22T09:58Z	Node and edge creation per stage, including chatset_hash derivation	C2
+E-014	flintx	source	soma/machinetalk/gate.py:79-108,169-290	2026-10-22T09:58Z	Per-stage required keys, verdict and hash-echo validation, skip and block semantics	C2
+E-015	flintx	source	soma/machinetalk/checkpoint.py:1-130	2026-10-22T09:58Z	Checkpoint file schema, statuses, atomic write	C2
+E-016	flintx	source	run_dashboard.py:16-38,98-115	2026-10-22T09:58Z	Dashboard port constant 9877, no argparse, kill_port/find_port/write_port_file	C2
+E-017	flintx	command	PYTHONPATH=turn-key:soma python3 -c importlib.util.find_spec + import machinetalk.engine	2026-10-22T09:58Z	turnkey resolves to site-packages; machinetalk/store resolve in project; engine imports	C1
+E-018	flintx	command	ps -eo pid,ppid,etimes,cmd | rg 'run_sessions|run_engine|soma|dashboard'; ss -lntp	2026-10-22T09:56:59Z	No soma process; no listener on 9876/9877/9878	C1
+E-019	flintx	command	cat .dashboard_port; ss -lntp	2026-10-22T09:56:59Z	Port file says 9878; nothing listening	C1
+E-020	flintx	logs	20261022_030327_pipeline.log tail; 20261022_030237_pipeline.log tail; 20261022_030126_pipeline.log tail	2026-10-22T09:56:59Z	Resume-skip lines and OUTROBEAVER DONE verdict=RED at 03:03:42 local	C1
+E-021	flintx	files	data/queue.json, data/soma_queue.json, data/.last_workers, data/.last_queue, data/.last_profile	2026-10-22T09:56:59Z	Queue contents and last-used queue/profile/worker state	C1
+E-022	flintx	command	python3 -m pytest soma/test_run_engine_soma_only.py -q	2026-10-22T09:59Z	6 tests pass for the soma-only path	C1
+E-023	flintx+remote	command	ssh engine 'hostname; systemctl is-active peacock-engine; systemctl show ...; curl :3099/health; ls -d .../soma'	2026-10-22T09:57:25Z	Remote host identity, service active, working dir, health ONLINE, no soma dir [remote]	C1
+E-024	flintx	command	getent hosts engine.save-aichats.com; tailscale status; curl -m 8 /health	2026-10-22T09:59Z	DNS 204.168.184.49; tailscale direct path; HTTP 200 in 0.529 s	C1
+E-025	flintx	data	soma/output/checkpoints/*.checkpoint.json (16 files)	2026-10-22T09:58Z	Stale RUNNING stage1 states; session_stages empty; sample FAILED/BLOCKED records	C1
+E-026	flintx	config	soma/turn-key-profiles/soma-current.json	2026-10-22T09:58Z	9-model deck, 12 stages useDeck, pipeline workers=1 timeout=180 maxRetries=10	C2
+E-027	flintx	source	run_sessions.py:60-82	2026-10-22T09:58Z	Auto-detect order for profiles	C2
+E-028	flintx	source	run_sessions.py:589-644	2026-10-22T09:58Z	Base-dir resolution, profile discovery under turn-key-profile, profile-builder launch	C2
+E-029	flintx	source	soma/machinetalk/invariants.py:13-66; engine.py:872-874	2026-10-22T09:58Z	Four hard-coded rules; registry constructed with no path	C2
+E-030	flintx	source	/home/flintx/.local/lib/python3.11/site-packages/turnkey/profile_integration.py:7-75; sdk.py:37	2026-10-22T09:58Z	SDK import surface and default engine URL engine.save-aichats.com:3099	C2
+E-031	flintx	source	run_sessions.py:472-515	2026-10-22T09:58Z	Picker launch via soma-session-picker/start.sh, SESSIONS_PATH and QUEUE_OUTPUT_PATH env, poll :5174	C2
+E-032	flintx	source	run_sessions.py:341-357,288-299	2026-10-22T09:58Z	Launcher starts run_dashboard.py on 9877 and passes --port 9877 to engine	C2
+E-033	flintx	source	soma/machinetalk/debug_dashboard.py:89-125,1199-1225	2026-10-22T09:58Z	Dashboard server uses fuser -k on the port then binds; write_event appends JSONL	C2
+E-034	flintx	files	soma/machine-talk/ (tb-001..tb-014, tb-003-system-base, tb-002-pipeline-protocol)	2026-10-22T09:58Z	Prompt corpus exists; tb-001 ends with [RAW_CHAT_TRANSCRIPT] marker; tb-012 is text-report protocol	C1
+E-035	flintx	docs	README.md; DROID-RESET.md; SESSION-LAUNCHER-GUIDE.md; machine-talk/MACHINE_TALK_SPEC.md; cli-manifest.json	2026-10-22T09:58Z	Documented claims and their mtimes; guide's stage file map is stale	C3

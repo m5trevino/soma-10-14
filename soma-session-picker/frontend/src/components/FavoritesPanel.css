@@ -1,0 +1,161 @@
+/* ── Favorites Panel ─────────────────────────────────────────────────────── */
+
+.favorites-panel {
+  width: 360px;
+  flex-shrink: 0;
+  background: #161b22;
+  border-right: 1px solid #30363d;
+  display: flex;
+  flex-direction: column;
+}
+
+.favorites-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 14px;
+  border-bottom: 1px solid #30363d;
+  font-weight: 600;
+  font-size: 14px;
+  color: #f0f6fc;
+}
+
+.favorites-panel-close {
+  background: none;
+  border: none;
+  color: #8b949e;
+  cursor: pointer;
+  font-size: 16px;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.favorites-panel-close:hover {
+  color: #c9d1d9;
+}
+
+.favorites-panel-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px;
+}
+
+.fav-empty {
+  color: #8b949e;
+  font-size: 13px;
+  text-align: center;
+  padding: 30px 10px;
+  line-height: 1.6;
+}
+
+.favorites-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.fav-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.fav-item:hover {
+  border-color: #58a6ff;
+}
+
+.fav-item-id {
+  flex: 1;
+  font-size: 12px;
+  color: #c9d1d9;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.fav-item-meta {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.fav-badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 10px;
+  background: #1f6feb22;
+  color: #58a6ff;
+  border: 1px solid #1f6feb44;
+  white-space: nowrap;
+}
+
+.fav-sentiment {
+  background: #a371f722;
+  color: #bc8cff;
+  border-color: #a371f744;
+}
+
+.fav-remove-btn {
+  background: none;
+  border: none;
+  color: #484f58;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+.fav-remove-btn:hover {
+  background: #da363322;
+  color: #f85149;
+}
+
+/* ── Header Buttons ─────────────────────────────────────────────────────── */
+
+.btn-add-fav {
+  background: #1f6feb;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+
+.btn-add-fav:hover {
+  background: #388bfd;
+}
+
+.btn-export-fav {
+  background: #238636;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+
+.btn-export-fav:hover:not(:disabled) {
+  background: #2ea043;
+}
+
+.btn-export-fav:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

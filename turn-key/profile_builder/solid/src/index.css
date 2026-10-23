@@ -1,0 +1,110 @@
+:root {
+  --bg: #0d1117;
+  --panel-bg: #161b22;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --dim: #8b949e;
+  --green: #3fb950;
+  --yellow: #d29922;
+  --purple: #a371f7;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  padding: 20px;
+}
+
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  margin-bottom: 16px;
+}
+
+input[type="text"],
+input[type="number"] {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 14px;
+}
+
+button {
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+button:hover {
+  background: var(--border);
+}
+
+button.primary {
+  background: #238636;
+  border-color: #238636;
+  color: #fff;
+}
+
+.badge {
+  display: inline-block;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-weight: 600;
+}
+
+.badge-provider {
+  background: #1f2937;
+  color: var(--dim);
+  border: 1px solid var(--border);
+}
+
+.badge-tools {
+  background: #1a3a2a;
+  color: var(--green);
+  border: 1px solid #238636;
+}
+
+.badge-context {
+  background: #1a2a3a;
+  color: #58a6ff;
+  border: 1px solid #1f6feb;
+}
+
+.badge-apex {
+  background: #3a2a1a;
+  color: var(--yellow);
+  border: 1px solid #9e6a03;
+}
+
+.badge-balanced {
+  background: #1a3a1a;
+  color: var(--green);
+  border: 1px solid #238636;
+}
+
+.badge-unknown {
+  background: #1a1a2a;
+  color: var(--dim);
+  border: 1px solid var(--border);
+}
+
+#app {
+  max-width: 1200px;
+  margin: 0 auto;
+}

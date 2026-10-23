@@ -1,0 +1,43 @@
+# Logs
+*.log
+*.html
+*.txt
+*.json
+!README.md
+
+# Data and temporary files
+data/
+session-picker-json/
+soma-10-14-merged-dirs/
+.dashboard_port
+.trevino-nonces.json
+.trevino-slice-state.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+ENV/
+
+# OS and IDE
+.DS_Store
+.idea/
+.vscode/
+.specstory/
+
+# Pipeline and DNA files
+*_pipeline.log
+DATA-DNA-*.md
+soma-10-14-DNA-*.txt
+soma-10-14-merged-*.txt
+soma-grok-sync-*.txt
+soma_favorites_*.json
+
+# Documentation and Guides (Keeping README, but excluding others if they are just notes)
+DROID-RESET.md
+SESSION-LAUNCHER-GUIDE.md
+slices*.md
+sync-project.skill.md
