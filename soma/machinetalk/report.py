@@ -225,11 +225,20 @@ class Manifest:
 # Live console cards
 # ---------------------------------------------------------------------------
 
-from pipeline.compact_cards import (
-    print_compact_card,
-    print_compact_card_done,
-    print_compact_card_start,
-)
+# When run_engine.py puts soma/ on sys.path, 'pipeline' is top-level.
+# When imported as package (systems_check), use relative import.
+try:
+    from pipeline.compact_cards import (
+        print_compact_card,
+        print_compact_card_done,
+        print_compact_card_start,
+    )
+except ImportError:
+    from ..pipeline.compact_cards import (
+        print_compact_card,
+        print_compact_card_done,
+        print_compact_card_start,
+    )
 
 
 def _bar(width: int, frac: float) -> str:

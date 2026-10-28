@@ -101,6 +101,14 @@ def main():
     dry_mode = "--dry" in sys.argv
     no_open = "--no-open" in sys.argv
 
+    # Dashboard skin: skeuomorphic by default.
+    # --skin classic  (or SOMA_DASHBOARD_SKIN=classic) restores the original UI.
+    skin = ""
+    if "--skin" in sys.argv:
+        i = sys.argv.index("--skin")
+        skin = sys.argv[i + 1].lower() if i + 1 < len(sys.argv) else ""
+    skin = skin or os.environ.get("SOMA_DASHBOARD_SKIN", "skeu").lower()
+
     # Kill any existing dashboard on the port
     kill_port(PORT)
 
@@ -115,7 +123,10 @@ def main():
     os.chdir(str(SOMA_DIR))
     sys.path.insert(0, str(SOMA_DIR))
 
-    from soma.machinetalk.debug_dashboard import start_dashboard
+    if skin in ("classic", "legacy", "original", "dark"):
+        from soma.machinetalk.debug_dashboard import start_dashboard
+    else:
+        from soma.machinetalk.debug_dashboard_skeu import start_dashboard
 
     # Open browser
     if not no_open:

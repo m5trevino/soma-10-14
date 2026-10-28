@@ -26,7 +26,7 @@ sys.path.insert(0, "/workspace/artifacts/turn-key")
 from machinetalk.client import EngineClient
 from machinetalk.engine import run
 from machinetalk.source import load_source
-from machinetalk.debug_dashboard import start_dashboard
+from machinetalk.debug_dashboard_skeu import start_dashboard
 
 
 def _log_output_path(output_path: str) -> None:
@@ -80,7 +80,9 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--source", default=None, help="session dir or project dir")
     p.add_argument("--queue", default=None, help="queue JSON file with selected session paths")
-    p.add_argument("--profile", required=True, help="TurnKey profile JSON")
+    p.add_argument("--profile", required=False, default=None,
+                   help="TurnKey profile JSON (defaults to the profile in the last queue, "
+                        "then the newest turn-key-profile/*.json)")
     p.add_argument("--out", default="/tmp/soma_out", help="output dir")
     p.add_argument("--debug", default="/tmp/soma_debug", help="debug JSONL dir")
     p.add_argument("--workers", type=int, default=2)
@@ -89,7 +91,23 @@ def main() -> int:
                    help="Process only the first session's first chat set (distiller), write Soma, exit")
     p.add_argument("--max-chatsets", type=int, default=None,
                    help="Maximum number of chatsets to process (0 or None = all)")
+    p.add_argument("--step-mode", action="store_true",
+                   help="Pause after each stage, waiting for Enter to continue")
+    p.add_argument("--stage", default=None,
+                   help="Run only this stage: distiller, introbeaver, planbeaver, outrobeaver")
+    p.add_argument("--granular", action="store_true",
+                   help="Pause before every individual step: dashboard, each beaver, each build stage, codebase, manifest")
+    p.add_argument("--force", action="store_true",
+                   help="Re-run stages even when the checkpoint says DONE")
+    p.add_argument("--only", action="append", default=None, metavar="SESSION:SET",
+                   help="Run only this chatset (repeatable), e.g. --only 250718-1380:1")
     args = p.parse_args()
+
+    if not args.profile:
+        args.profile = _default_profile()
+    if not args.profile:
+        print("Error: --profile is required (no profile found)", flush=True)
+        return 1
 
     if args.soma_only:
         return _soma_only_run(args)
@@ -108,6 +126,9 @@ def main() -> int:
 
     client = EngineClient(args.profile)
 
+    # Dashboard prompt is handled by the parent launcher (run_sessions.py)
+    # when --granular is used through the launcher flow.
+
     threading.Thread(
         target=start_dashboard,
         args=(args.debug,),
@@ -116,6 +137,16 @@ def main() -> int:
     ).start()
     print(f"Dashboard: http://127.0.0.1:{args.port}")
 
+    only = None
+    if args.only:
+        only = []
+        for spec in args.only:
+            sid, sep, num = spec.rpartition(":")
+            if not sep or not sid or not num.isdigit():
+                print(f"Error: --only expects SESSION:SET, got {spec!r}", flush=True)
+                return 1
+            only.append((sid, int(num)))
+
     ret = run(
         sessions_list,
         out_dir=Path(args.out),
@@ -123,9 +154,29 @@ def main() -> int:
         workers=args.workers,
         debug_dir=args.debug,
         max_chatsets=args.max_chatsets,
+        step_mode=args.step_mode,
+        stage=args.stage,
+        granular=args.granular,
+        force=args.force,
+        only=only,
     )
     _log_output_path(args.out)
     return ret
+
+
+def _default_profile() -> str | None:
+    """Resolve a profile without asking the user for a path."""
+    root = Path(__file__).resolve().parent.parent
+    queue = root / "data" / "soma_queue.json"
+    if queue.exists():
+        try:
+            prof = json.loads(queue.read_text()).get("profile")
+            if prof and Path(prof).is_file():
+                return str(prof)
+        except (OSError, json.JSONDecodeError):
+            pass
+    profiles = sorted((root / "turn-key-profile").glob("*.json"))
+    return str(profiles[-1]) if profiles else None
 
 
 # ---------------------------------------------------------------------------
@@ -253,9 +304,10 @@ def _soma_only_run(args) -> int:
     # Print results
     print(f"\nSoma: {soma_path}", flush=True)
     print(f"Nodes: {soma.node_count()}", flush=True)
+    rows = soma._conn.execute("SELECT node_type, node_id FROM nodes ORDER BY node_type, node_id").fetchall()
     node_types = {}
-    for n in soma._nodes.values():
-        node_types.setdefault(n.node_type, []).append(n.node_id)
+    for row in rows:
+        node_types.setdefault(row[0], []).append(row[1])
     for t in sorted(node_types):
         print(f"  {t}: {len(node_types[t])}", flush=True)
     print(f"Edges: {soma.edge_count()}", flush=True)

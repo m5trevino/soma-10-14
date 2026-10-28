@@ -263,7 +263,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if SOMA_DIR:
                 # Check in any output dir's checkpoints
                 for sd in SOMA_DIR.glob("*/"):
-                    cp = sd / "checkpoints" / f"{sid}.checkpoint.json"
+                    cp = sd / "checkpoints" / f"{sid}.chunks.checkpoint.json"
+                    if not cp.exists():
+                        cp = sd / "checkpoints" / f"{sid}.checkpoint.json"
                     if cp.exists():
                         try:
                             cp_data = json.loads(cp.read_text())

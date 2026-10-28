@@ -208,7 +208,12 @@ def interactive_pick():
 def run_pipeline(paths: list[str], full_objects: list[dict] | None = None,
                  max_chatsets: int | None = None,
                  profile: str | None = None,
-                 workers: int | None = None):
+                 workers: int | None = None,
+                 step_mode: bool = False,
+                 stage: str | None = None,
+                 granular: bool = False,
+                 force: bool = False,
+                 only: list[tuple[str, int]] | None = None):
     """Run the SOMA pipeline on the selected sessions.
 
     Uses soma/run_engine.py with --queue for native queue consumption.
@@ -259,6 +264,10 @@ def run_pipeline(paths: list[str], full_objects: list[dict] | None = None,
     print()
 
     # Start dashboard
+    if granular:
+        print("\n  [Step: start dashboard. Enter to run, Ctrl+C to skip]")
+        try: input()
+        except EOFError: pass
     dashboard_proc = start_dashboard()
 
     # Write queue file for dashboard compatibility
@@ -295,28 +304,33 @@ def run_pipeline(paths: list[str], full_objects: list[dict] | None = None,
     ]
     if max_chatsets is not None and max_chatsets > 0:
         cmd.extend(["--max-chatsets", str(max_chatsets)])
+    if step_mode:
+        cmd.append("--step-mode")
+    if stage:
+        cmd.extend(["--stage", stage])
+    if granular:
+        cmd.append("--granular")
+    if force:
+        cmd.append("--force")
+    for sid, setnum in (only or []):
+        cmd.extend(["--only", f"{sid}:{setnum}"])
 
+    exit_code = None
     try:
+        # Inherit stdio so stage output (and granular prompts) stream live
+        # instead of being buffered until the subprocess exits.
         result = subprocess.run(
             cmd,
             cwd=str(SOMA_DIR),
             env=os.environ,
-            capture_output=True, text=True, timeout=36000,
+            timeout=36000,
         )
-
-        if result.stdout:
-            for line in result.stdout.strip().split("\n"):
-                if line.strip():
-                    print(f"  {line}")
+        exit_code = result.returncode
 
         if result.returncode == 0:
             print(f"\n  \u2713 Pipeline complete")
         else:
             print(f"\n  \u2717 Pipeline failed (exit {result.returncode})")
-            if result.stderr:
-                for line in result.stderr.strip().split("\n")[-20:]:
-                    if line.strip():
-                        print(f"  {line}")
     except subprocess.TimeoutExpired:
         print("\n  \u2717 Pipeline timed out (10h limit)")
     except KeyboardInterrupt:
@@ -331,7 +345,7 @@ def run_pipeline(paths: list[str], full_objects: list[dict] | None = None,
 
     queue_data["running"] = False
     queue_data["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
-    queue_data["exit_code"] = result.returncode
+    queue_data["exit_code"] = exit_code
     qpath.write_text(json.dumps(queue_data, indent=2))
 
     print(f"\n  Dashboard: http://127.0.0.1:{PORT}")
@@ -410,7 +424,9 @@ def show_progress():
         sid = Path(path).name
         found = False
         for sd in SOMA_PKG.glob("*/"):
-            cp = sd / "checkpoints" / f"{sid}.checkpoint.json"
+            cp = sd / "checkpoints" / f"{sid}.chunks.checkpoint.json"
+            if not cp.exists():
+                cp = sd / "checkpoints" / f"{sid}.checkpoint.json"
             if cp.exists():
                 found = True
                 try:
@@ -851,7 +867,7 @@ def _select_workers(state: dict) -> int:
             print("  Invalid. Enter a number >= 1.")
 
 
-def run_launcher() -> None:
+def run_launcher(granular: bool = False, force: bool = False) -> None:
     """4-step interactive launcher.
 
     Step 1 — Pick TurnKey profile
@@ -861,9 +877,21 @@ def run_launcher() -> None:
     """
     state = _get_last_state()
 
+    if granular:
+        print("\n  [Step: profile selection]")
+        print("  Enter to continue, Ctrl+C to skip")
+        try: input()
+        except EOFError: pass
+
     # Step 1: Profile
     profile = _select_profile(state)
     state["profile"] = profile
+
+    if granular:
+        print("\n  [Step: queue/session selection]")
+        print("  Enter to continue, Ctrl+C to skip")
+        try: input()
+        except EOFError: pass
 
     # Step 2: Sessions / Queue
     queue_file, full_objects = _select_queue(state)
@@ -873,7 +901,7 @@ def run_launcher() -> None:
     session_ids = []
     paths = []
     if queue_file == "web_picker":
-        run_web_picker_and_pipeline(QUEUE_FILE)
+        run_web_picker_and_pipeline(QUEUE_FILE, granular=granular, force=force)
         return
     if queue_file != "skip":
         result = load_queue(queue_file)
@@ -886,28 +914,65 @@ def run_launcher() -> None:
         paths = []
 
     # Step 3: Workers
+    if granular:
+        print("\n  [Step: workers]")
+        print("  Enter to continue, Ctrl+C to skip")
+        try: input()
+        except EOFError: pass
     workers = _select_workers(state)
     state["workers"] = str(workers)
 
-    # Max chatsets
-    max_chatsets = _prompt_max_chatsets()
+    # Session selection
+    if granular:
+        print("\n  [Step: session selection]")
+        print("  Enter to continue, Ctrl+C to skip")
+        try: input()
+        except EOFError: pass
+    pick = _prompt_session(paths)
+    only = [pick] if pick else None
+    max_chatsets = None if only else _prompt_max_chatsets()
+    selected_stage = "distiller" if only else None
 
     # Save state
     _save_state(state)
 
-    # Compute totals from full_objects
+    # Compute totals from the actual chunk-level source loader. Picker
+    # metadata counts set_number groups, but the engine now processes one
+    # physical chunk file per ChatSet.
     total_chatsets = 0
     total_characters = 0
-    for obj in full_objects:
-        if isinstance(obj, dict):
-            cs = obj.get("total_sets")
-            if cs is not None:
-                total_chatsets += cs
-            ch = obj.get("character_count")
-            if ch is not None:
-                total_characters += ch
+    try:
+        sys.path.insert(0, str(SOMA_PKG))
+        from machinetalk.source import load_session
+        for path in paths:
+            try:
+                sess = load_session(Path(path))
+            except Exception:
+                continue
+            total_chatsets += len(sess.chatsets)
+            total_characters += sum(cs.chars for cs in sess.chatsets)
+    except Exception:
+        pass
+
+    # Fallback if no sessions could be loaded (for example a skip queue).
+    if total_chatsets == 0:
+        for obj in full_objects or []:
+            if isinstance(obj, dict):
+                total_chatsets += int(obj.get("total_sets") or 0)
+                total_characters += int(obj.get("total_session_chars") or 0)
 
     # Step 4: Summary + countdown
+    if granular:
+        print("\n  [Step: summary + countdown]")
+        print("  Enter to run, Ctrl+C to skip")
+        try:
+            answer = input().strip().lower()
+            if answer == "n" or answer == "no":
+                print("  Aborted.")
+                return
+        except EOFError:
+            pass
+
     print("\n  ═══════════════════════════════════════════════════════")
     print("  Summary")
     print("  ═══════════════════════════════════════════════════════")
@@ -920,6 +985,11 @@ def run_launcher() -> None:
     print(f"  Total characters: {total_characters}")
     if max_chatsets is not None:
         print(f"  Max chatsets: {max_chatsets}")
+    if only:
+        sid, n = only[0]
+        print(f"  Session:  {sid}")
+        print(f"  Chatset:  first (set {n})")
+        print(f"  Stage:    distiller")
     print()
 
     answer = input("  Launch? [Y/n]: ").strip().lower()
@@ -941,7 +1011,8 @@ def run_launcher() -> None:
 
     run_pipeline(paths, full_objects if full_objects else [],
                  max_chatsets=max_chatsets, profile=profile,
-                 workers=workers)
+                 workers=workers, granular=granular, force=force,
+                 only=only, stage=selected_stage)
 
 
 # ── CLI Session Picker ───────────────────────────────────────────────
@@ -1065,7 +1136,8 @@ def load_and_pick_sessions(queue_path: str) -> list[str] | None:
     return selected_ids
 
 
-def run_web_picker_and_pipeline(queue_path: str):
+def run_web_picker_and_pipeline(queue_path: str, granular: bool = False,
+                                force: bool = False):
     """Launch the web session picker, let user pick sessions, then run pipeline."""
     import os
 
@@ -1073,6 +1145,12 @@ def run_web_picker_and_pipeline(queue_path: str):
     if not picker_script.exists():
         print(f"  ERROR: Web picker not found at {picker_script}")
         return
+
+    if granular:
+        print("\n  [Step: web session picker. Enter to run, Ctrl+C to skip]")
+        print("  Close the browser or press Ctrl+C when done picking.")
+        try: input()
+        except EOFError: pass
 
     print(f"\n  ═══════════════════════════════════════════════════════")
     print(f"  Starting Web Session Picker...")
@@ -1120,8 +1198,12 @@ def run_web_picker_and_pipeline(queue_path: str):
     print(f"  Queue: {queue_path}")
 
     # Run pipeline
-    max_chatsets = _prompt_max_chatsets()
-    run_pipeline(paths, full_objects if full_objects else [], max_chatsets=max_chatsets)
+    pick = _prompt_session(paths)
+    only = [pick] if pick else None
+    max_chatsets = None if only else _prompt_max_chatsets()
+    stage_sel = "distiller" if only else None
+    run_pipeline(paths, full_objects if full_objects else [], max_chatsets=max_chatsets,
+                 granular=granular, force=force, only=only, stage=stage_sel)
 
 
 def poll_for_launch_config(timeout=None) -> dict:
@@ -1208,24 +1290,78 @@ def select_sessions_from_config(config: dict) -> list[str]:
     return paths, full_objects if full_objects else []
 
 
-def _prompt_max_chatsets() -> int | None:
-    """Prompt the user for how many chatsets to process.
+def _load_session_entries(paths: list[str]) -> list[tuple[str, int, int, int]]:
+    """Return [(session_id, first_set, total_sets, total_chars)] per session."""
+    entries: list[tuple[str, int, int, int]] = []
+    try:
+        sys.path.insert(0, str(SOMA_PKG))
+        from machinetalk.source import load_session
+    except Exception:
+        return entries
+    for path in paths:
+        try:
+            sess = load_session(Path(path))
+        except Exception:
+            continue
+        if not sess.chatsets:
+            continue
+        entries.append((
+            sess.session_id,
+            sess.chatsets[0].set_number,
+            len(sess.chatsets),
+            sum(cs.chars for cs in sess.chatsets),
+        ))
+    return entries
 
-    Returns:
-        None = process all chatsets, or an int >= 1 if user enters a number.
+
+def _prompt_session(paths: list[str]) -> tuple[str, int] | None:
+    """List chat sessions and pick one. Returns (session_id, first set)."""
+    entries = _load_session_entries(paths)
+    if not entries:
+        return None
+
+    print(f"\n  Chat sessions ({len(entries)}):")
+    for i, (sid, first, total, chars) in enumerate(entries, start=1):
+        label = sid if len(sid) <= 34 else sid[:31] + "..."
+        print(f"    [{i:>3}] {label:<36} {total:>4} chatsets  "
+              f"{chars:>10,} chars   first set {first}")
+    print()
+
+    while True:
+        raw = input("  Select session [1]: ").strip()
+        if not raw:
+            sid, first, _, _ = entries[0]
+            return sid, first
+        try:
+            n = int(raw)
+        except ValueError:
+            print("  Enter a session number.")
+            continue
+        if n < 1 or n > len(entries):
+            print(f"  Enter 1-{len(entries)}.")
+            continue
+        sid, first, _, _ = entries[n - 1]
+        return sid, first
+
+
+def _prompt_max_chatsets() -> int | None:
+    """Prompt for how many chatset chunks to process.
+
+    The engine unit is one physical chunk. The default is 1 so a plain run
+    never fans out across the whole queue.
     """
     while True:
-        raw = input("  How many chatsets to process? (Enter for all, or a number): ").strip()
+        raw = input("  How many chatset chunks to process? [1]: ").strip()
         if not raw:
-            return None  # all
+            return 1
         try:
             n = int(raw)
             if n < 1:
-                print("  Please enter a positive number or press Enter for all.")
+                print("  Please enter a positive number.")
                 continue
             return n
         except ValueError:
-            print("  Invalid input. Enter a number or press Enter for all.")
+            print("  Invalid input. Enter a number.")
 
 
 def main():
@@ -1259,6 +1395,15 @@ Examples:
                         help="Dashboard port (default: 9877)")
     parser.add_argument("--profile", type=str, default=None,
                         help="TurnKey profile path")
+    parser.add_argument("--step-mode", action="store_true",
+                        help="Pause after each stage, waiting for Enter to continue")
+    parser.add_argument("--stage", default=None,
+                        help="Run only one stage: distiller, introbeaver, planbeaver, outrobeaver")
+    parser.add_argument("--granular", action="store_true",
+                        help="Pause before every single step: profile, queue, sessions, chatsets, workers, "
+                             "dashboard, each beaver, each build stage, codebase, manifest")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-run stages even when the checkpoint says DONE")
 
     args = parser.parse_args()
 
@@ -1281,7 +1426,8 @@ Examples:
             print("  No sessions resolved on disk.")
             return
         max_chatsets = _prompt_max_chatsets()
-        run_pipeline(paths, full_objects if full_objects else [], max_chatsets=max_chatsets)
+        run_pipeline(paths, full_objects if full_objects else [], max_chatsets=max_chatsets,
+                     granular=args.granular, force=args.force)
         return
 
     # --all: scan all sessions, skip picker
@@ -1302,7 +1448,8 @@ Examples:
         qpath.write_text(json.dumps(queue_data, indent=2))
         print(f"  Queued {len(paths)} sessions for processing")
         max_chatsets = _prompt_max_chatsets()
-        run_pipeline(paths, [], max_chatsets=max_chatsets)
+        run_pipeline(paths, [], max_chatsets=max_chatsets, granular=args.granular,
+                     force=args.force)
         return
 
     # --cli-picker: interactive CLI selection from queue JSON
@@ -1318,11 +1465,12 @@ Examples:
         result = load_queue(args.queue)
         _, full_objects = result if result else (None, [])
         max_chatsets = _prompt_max_chatsets()
-        run_pipeline(paths, full_objects if full_objects else [], max_chatsets=max_chatsets)
+        run_pipeline(paths, full_objects if full_objects else [], max_chatsets=max_chatsets,
+                     granular=args.granular, force=args.force)
         return
 
     # DEFAULT: run the 4-step interactive launcher
-    run_launcher()
+    run_launcher(granular=args.granular, force=args.force)
 
 
 if __name__ == "__main__":

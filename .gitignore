@@ -1,43 +1,108 @@
-# Logs
+# === Chat & Session Logs ===
+goose_chats_last_4_days/
+.soma-logs/
 *.log
-*.html
-*.txt
-*.json
+
+# === Old Notes, Forensics & Write-ups ===
+docs/
+docs-soma/
+skeu-style-docs/
+newmachine/
+*.md
 !README.md
+!soma/machine-talk/*.md
+!soma/machine-talk-OLD/*.md
+!soma/docs/*.md
+!soma/PIPELINE_ACTION_MAP.md
+!soma/SESSION_HANDOFF.md
+!soma/TURNKEY_TECHNICAL_MANUAL.md
+!turn-key/TB-*.md
+!turn-key/TURNKEY_TECHNICAL_MANUAL.md
+!soma-grok/README.md
+!soma-grok/DOCUMENTATION.md
+!soma-grok/INTEGRATION_GUIDE.md
+!soma-grok/TURNKEY_TECHNICAL_MANUAL.md
+!soma-grok/soma-session-picker/DOCUMENTATION.md
+!soma-grok/soma-session-picker/INTEGRATION_GUIDE.md
+!soma-session-picker/DOCUMENTATION.md
+!soma-session-picker/INTEGRATION_GUIDE.md
+!soma-session-picker/SKEUOMORPHIC-REDESIGN.md
+!soma-session-picker/session-picker-ui-and-wiring.md
+!soma-10-14-tracer-bullets.yaml
 
-# Data and temporary files
-data/
-session-picker-json/
-soma-10-14-merged-dirs/
-.dashboard_port
-.trevino-nonces.json
-.trevino-slice-state.json
+# === Skeuomorph Previews & Images ===
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.pdf
 
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-.pytest_cache/
-.venv/
-venv/
-ENV/
+# === Session Data (keep somas/ but ignore heavy ones) ===
+somas/*/soma.db-wal
+somas/*/soma.db-shm
+somas/*/soma.json-wal
+somas/*/soma.json-shm
 
-# OS and IDE
-.DS_Store
-.idea/
-.vscode/
-.specstory/
+# === Node modules ===
+node_modules/
 
-# Pipeline and DNA files
-*_pipeline.log
-DATA-DNA-*.md
-soma-10-14-DNA-*.txt
-soma-10-14-merged-*.txt
+# === Build outputs ===
+*/dist/
+
+# === Local/stub files ===
+.model_registry.db
+model_registry.db
+bin/
+.kimchi/
+
+# === Temporary/stub scripts ===
+repro_fail.py
+systems_check.py
+soma_board.py
+parse_goose_chats.py
+
+# === Temp sync/diagnostic dumps ===
+*-DNA-*.txt
+*-merged-*.txt
 soma-grok-sync-*.txt
-soma_favorites_*.json
+debug_dashboard_report.txt
 
-# Documentation and Guides (Keeping README, but excluding others if they are just notes)
-DROID-RESET.md
-SESSION-LAUNCHER-GUIDE.md
-slices*.md
-sync-project.skill.md
+# === __pycache__ and build artifacts ===
+__pycache__/
+*.pyc
+*/__pycache__/
+*.egg-info/
+*/.venv/
+venv/
+*/venv/
+
+# === Session/favorites JSON ===
+soma_favorites_*.json
+example_session_data.json
+session-picker-json/
+
+# === Forensic docs (deep nested) ===
+session-pickerdocs/
+
+# === HTML previews ===
+style-preview.html
+soma_pipeline_interactive.html
+soma_pipeline_provenance.html
+
+# === .specstory / .trevino state ===
+.specstory/
+.trevino-*.json
+soma/.trevino-slice-state.json
+
+# === Data dirs ===
+data/
+soma/data/
+soma/artifacts/
+soma/stage1/
+soma/stage2/
+soma/stage3/
+soma/stage4/
+soma/turn-key-profiles/
+soma/workspaces/
+
+

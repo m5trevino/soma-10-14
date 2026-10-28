@@ -47,9 +47,8 @@ class SomaBridge:
     def write_session_anchor(self, session_id: str, project_name: str = "",
                              total_sets: int = 0, total_chars: int = 0) -> dict[str, int]:
         anchor_id = f"anchor-{session_id}"
-        existing = self._soma.get_node(anchor_id)
-        if existing:
-            self._soma.delete_node(anchor_id)
+        # Update in place: deleting the anchor would drop CONTAINS edges to
+        # every other ChatSet in the session.
         self._soma.create_node("SessionAnchor", {
             "id": anchor_id,
             "session_id": session_id,
@@ -60,9 +59,48 @@ class SomaBridge:
         })
         return {"SessionAnchor": 1}
 
+    def _purge_chatset_children(self, chatset_id: str) -> None:
+        """Remove previously written derived nodes for this chatset.
+
+        Works with both the old in-memory store (_nodes dict) and the new
+        SQLite store (conn attribute).
+        """
+        prefixes = (
+            f"msg-{chatset_id}-",
+            f"distilled-{chatset_id}",
+            f"directive-{chatset_id}-",
+            f"constraint-{chatset_id}-",
+            f"preference-{chatset_id}-",
+            f"question-{chatset_id}-",
+            f"artifact-{chatset_id}-",
+            f"stack-{chatset_id}",
+            f"chrono-{chatset_id}-",
+            f"noise-{chatset_id}",
+        )
+        # Find nodes to delete
+        to_delete = []
+        if hasattr(self._soma, "_nodes"):
+            # Old in-memory store
+            for nid in list(self._soma._nodes):
+                if any(nid.startswith(p) for p in prefixes):
+                    to_delete.append(nid)
+        elif hasattr(self._soma, "conn"):
+            # New SQLite store
+            for p in prefixes:
+                rows = self._soma.conn.execute(
+                    "SELECT node_id FROM nodes WHERE node_id LIKE ?",
+                    (p + "%",),
+                ).fetchall()
+                for r in rows:
+                    to_delete.append(r["node_id"])
+        for nid in to_delete:
+            self._soma.delete_node(nid)
+
     def write_chatset(self, session_id: str, chatset_id: str,
                       set_number: int, chars: int,
+                      chatset_hash: str = "",
                       provider: str = "", models_used: list[str] | None = None) -> dict[str, int]:
+        self._purge_chatset_children(chatset_id)
         existing = self._soma.get_node(chatset_id)
         if existing:
             self._soma.delete_node(chatset_id)
@@ -73,11 +111,170 @@ class SomaBridge:
             "chars": chars,
             "provider": provider or "unknown",
             "models_used": json.dumps(models_used or []),
-            "chatset_hash": chatset_id.split(":")[-1] if ":" in chatset_id else chatset_id,
+            "chatset_hash": chatset_hash or "",
         })
         anchor_id = f"anchor-{session_id}"
         self._soma.create_edge(anchor_id, "CONTAINS", chatset_id)
         return {"ChatSet": 1}
+
+    def write_raw_messages(self, cs: Any) -> dict[str, int]:
+        """Write the verbatim conversation turns as queryable Message nodes."""
+        chatset_id = cs.chatset_id
+        session_id = getattr(cs, "session_id", "")
+        count = 0
+        for i, msg in enumerate(getattr(cs, "raw_chat_set", []) or []):
+            msg = msg or {}
+            role = str(msg.get("role", "") or "")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                for p in content:
+                    if isinstance(p, dict):
+                        parts.append(str(p.get("text", p.get("content", ""))))
+                    else:
+                        parts.append(str(p))
+                content = "\n".join(parts)
+            content = str(content)
+            mid = f"msg-{chatset_id}-{i}"
+            if self._soma.get_node(mid):
+                self._soma.delete_node(mid)
+            self._soma.create_node("Message", {
+                "id": mid,
+                "session_id": session_id,
+                "chat_set_id": chatset_id,
+                "turn_index": i,
+                "role": role,
+                "chars": len(content),
+                "content": content,
+            })
+            self._soma.create_edge(chatset_id, "HAS_MESSAGE", mid)
+            count += 1
+        return {"Message": count}
+
+    def write_distilled(self, session_id: str, chatset_id: str, set_number: int,
+                        gate: Any, model_id: str, latency_ms: float) -> dict[str, int]:
+        """Write the distiller's canonical payload into the graph."""
+        parsed = getattr(gate, "parsed", None) or {}
+        if not isinstance(parsed, dict):
+            return {}
+        counts: dict[str, int] = {}
+
+        did = f"distilled-{chatset_id}"
+        if self._soma.get_node(did):
+            self._soma.delete_node(did)
+        self._soma.create_node("DistilledChatSet", {
+            "id": did,
+            "session_id": session_id,
+            "chat_set_id": chatset_id,
+            "set_number": set_number,
+            "chatset_hash": str(parsed.get("chatset_hash") or ""),
+            "intent": str(parsed.get("intent") or ""),
+            "signal_quality": parsed.get("signal_quality"),
+            "bytes_original": parsed.get("bytes_original"),
+            "bytes_distilled": parsed.get("bytes_distilled"),
+            "skip": bool(parsed.get("skip")),
+            "skip_reason": parsed.get("skip_reason"),
+            "exfil_type": parsed.get("exfil_type"),
+            "model_id": model_id,
+            "latency_ms": round(latency_ms, 1),
+            "processed_at": _now(),
+        })
+        self._soma.create_edge(chatset_id, "DISTILLED_TO", did)
+        counts["DistilledChatSet"] = 1
+
+        def _add_list(key: str, node_type: str, rel: str) -> None:
+            items = parsed.get(key) or []
+            if not isinstance(items, (list, tuple)):
+                return
+            c = 0
+            for i, item in enumerate(items):
+                text = item.get("text", "") if isinstance(item, dict) else str(item)
+                if not str(text).strip():
+                    continue
+                nid = f"{node_type.lower()}-{chatset_id}-{i}"
+                if self._soma.get_node(nid):
+                    self._soma.delete_node(nid)
+                self._soma.create_node(node_type, {
+                    "id": nid, "session_id": session_id,
+                    "chat_set_id": chatset_id, "text": str(text), "index": i,
+                })
+                self._soma.create_edge(did, rel, nid)
+                c += 1
+            if c:
+                counts[node_type] = c
+
+        _add_list("directives", "Directive", "HAS_DIRECTIVE")
+        _add_list("constraints", "Constraint", "HAS_CONSTRAINT")
+        _add_list("preferences", "Preference", "HAS_PREFERENCE")
+        _add_list("questions", "Question", "HAS_QUESTION")
+
+        arts = parsed.get("artifacts_mentioned") or []
+        c = 0
+        for i, a in enumerate(arts if isinstance(arts, (list, tuple)) else []):
+            text = str(a).strip()
+            if not text:
+                continue
+            nid = f"artifact-{chatset_id}-{i}"
+            if self._soma.get_node(nid):
+                self._soma.delete_node(nid)
+            self._soma.create_node("Artifact", {
+                "id": nid, "session_id": session_id,
+                "chat_set_id": chatset_id, "path": text, "index": i,
+            })
+            self._soma.create_edge(did, "HAS_ARTIFACT", nid)
+            c += 1
+        if c:
+            counts["Artifact"] = c
+
+        stack = parsed.get("stack_inferred")
+        if isinstance(stack, dict) and (stack.get("language") or stack.get("framework")):
+            nid = f"stack-{chatset_id}"
+            if self._soma.get_node(nid):
+                self._soma.delete_node(nid)
+            self._soma.create_node("Stack", {
+                "id": nid, "session_id": session_id, "chat_set_id": chatset_id,
+                "language": stack.get("language"),
+                "framework": stack.get("framework"),
+                "confidence": stack.get("confidence"),
+            })
+            self._soma.create_edge(did, "HAS_STACK", nid)
+            counts["Stack"] = 1
+
+        chrono = parsed.get("chronology_resolved") or []
+        c = 0
+        for i, entry in enumerate(chrono if isinstance(chrono, (list, tuple)) else []):
+            if not isinstance(entry, dict):
+                continue
+            nid = f"chrono-{chatset_id}-{i}"
+            if self._soma.get_node(nid):
+                self._soma.delete_node(nid)
+            self._soma.create_node("Chronology", {
+                "id": nid, "session_id": session_id, "chat_set_id": chatset_id,
+                "topic": entry.get("topic", ""),
+                "final_answer": entry.get("final_answer", ""),
+                "superseded": json.dumps(entry.get("superseded", []) or []),
+            })
+            self._soma.create_edge(did, "HAS_CHRONOLOGY", nid)
+            c += 1
+        if c:
+            counts["Chronology"] = c
+
+        ns = parsed.get("noise_signature")
+        if isinstance(ns, dict):
+            nid = f"noise-{chatset_id}"
+            if self._soma.get_node(nid):
+                self._soma.delete_node(nid)
+            props = {"id": nid, "session_id": session_id, "chat_set_id": chatset_id}
+            for k in ("greeting_count", "apology_count", "hedge_count",
+                      "filler_count", "repetition_count", "assistant_fluff_count",
+                      "visual_feedback_count", "sign_off_count",
+                      "total_bytes_noise", "total_bytes_signal"):
+                props[k] = ns.get(k)
+            self._soma.create_node("NoiseSignature", props)
+            self._soma.create_edge(did, "HAS_NOISE", nid)
+            counts["NoiseSignature"] = 1
+
+        return counts
 
     def write_receptor(self, session_id: str, chatset_id: str,
                        set_number: int, gate: Any, model_id: str,

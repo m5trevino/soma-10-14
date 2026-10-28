@@ -28,6 +28,7 @@ the same node types and edge types used by the legacy pipeline dendrites.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sys
@@ -48,6 +49,12 @@ from .source import ChatSet, Session
 from .logger import StageLogger
 from . import progress
 
+# ── Stage-1 stages that drive the one-line spinner ───────────────────────
+_LIVE_STAGES = ("distiller", "introbeaver", "planbeaver", "outrobeaver")
+
+# Per-session SOMA databases: <repo>/somas/<session_id>/soma.json
+SOMAS_DIR = Path(__file__).resolve().parents[2] / "somas"
+
 # ── Dividers ──────────────────────────────────────────────────────────────
 _DIVIDER = ("■□■□■□■□■□■□■□■■□■□■□■□■□■□■□■■□■□■□■□■□■□■□"
             "■■□■□■□■□■□■□■□■■□■□■□■□■□■□■□■■□■□■□■□■□■□■□"
@@ -58,7 +65,10 @@ import os as _os
 from pathlib import Path as _Path
 import json as _json
 import threading as _threading
-from store import Soma
+try:
+    from ..store import Soma
+except ImportError:
+    from store import Soma
 
 
 class AtomicSoma:
@@ -72,20 +82,37 @@ class AtomicSoma:
     def __getattr__(self, name):
         return getattr(self._soma, name)
 
+    @property
+    def path(self) -> _Path:
+        """On-disk location of the persisted SOMA database."""
+        return self._path
+
     def _persist(self) -> None:
         """Atomic write: dump to .tmp, then rename."""
         with self._lock:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            data = {
-                "nodes": {
+            # Handle both old in-memory Soma (_nodes dict) and new SQLite-backed Soma
+            if hasattr(self._soma, "_nodes"):
+                nodes = {
                     nid: {"type": n.node_type, "properties": n.properties}
                     for nid, n in self._soma._nodes.items()
-                },
-                "edges": [
-                    {"source": e.source, "relationship": e.rel_type, "target": e.target}
+                }
+                edges = [
+                    {"source": e.source, "rel_type": e.rel_type,
+                     "target": e.target, "id": getattr(e, "id", "")}
                     for e in self._soma._edges
-                ],
-            }
+                ]
+            else:
+                # SQLite-backed Soma — query the database
+                rows = self._soma._conn.execute(
+                    "SELECT node_id, node_type, properties FROM nodes ORDER BY node_id"
+                ).fetchall()
+                nodes = {row[0]: {"type": row[1], "properties": json.loads(row[2])} for row in rows}
+                edge_rows = self._soma._conn.execute(
+                    "SELECT edge_id, source, rel_type, target FROM edges ORDER BY edge_id"
+                ).fetchall()
+                edges = [{"id": r[0], "source": r[1], "rel_type": r[2], "target": r[3]} for r in edge_rows]
+            data = {"nodes": nodes, "edges": edges}
             tmp_path = self._path.with_suffix(self._path.suffix + ".tmp")
             with open(tmp_path, "w", encoding="utf-8") as f:
                 _json.dump(data, f, indent=2)
@@ -150,26 +177,30 @@ class Engine:
                  force: bool = False,
                  gateway_map: dict | None = None,
                  debug_dir: str | None = None,
-                 max_chatsets: int | None = None) -> None:
+                 max_chatsets: int | None = None,
+                 step_mode: bool = False,
+                 soma_path: Path | None = None) -> None:
         self.out = Path(out_dir)
         self.client = client
         self.workers = max(1, workers)
         self.force = force
         self.max_chatsets = max_chatsets
+        self.step_mode = step_mode
+        self.granular = False
         self.gateway_map = gateway_map
-        self.ck = CheckpointStore(self.out)
+        self.ck = CheckpointStore(self.out, layout="chunk")
         self.manifest = Manifest(self.out)
         self.art_dir = self.out / "artifacts"
         self.log = StageLogger(cwd=Path.cwd(), out_dir=self.out, quiet=quiet)
-        self._print = (lambda *a: None) if quiet else print
+        self._print = (lambda *a: None) if quiet else progress.emit
         self._debug_dir = Path(debug_dir) if debug_dir else None
         if self._debug_dir:
             self._debug_dir.mkdir(parents=True, exist_ok=True)
         self._manifest_lock = threading.Lock()
 
-        # Soma graph store (per-session)
-        soma_path = self.out / "soma.json"
-        self._soma = AtomicSoma(str(soma_path))
+        # Soma graph store (per-session by default)
+        soma_file = Path(soma_path) if soma_path else self.out / "soma.json"
+        self._soma = AtomicSoma(str(soma_file))
         self._bridge = SomaBridge(self._soma)
         self._soma_lock = threading.Lock()
         self._print_lock = threading.Lock()
@@ -193,11 +224,15 @@ class Engine:
                       (f" chatset={chatset}" if chatset else "") +
                       f" | {', '.join(parts)}")
 
-    def _with_spinner(self, label: str, fn, *args, **kwargs):
-        """No-op: removed spinner — it overwrote all readable progress output.
-        The client prints ATTEMPT/FAIL during calls, and the engine prints
-        DONE/BLOCKED/FAILED after. That's the real visibility we need.
+    def _with_spinner(self, label: str, fn, *args,
+                      live_stage: str = "", **kwargs):
+        """Run ``fn`` behind the one-line stage progress printer.
+
+        Only the four Stage-1 beaver stages own the live line. Other stages
+        keep printing normally so their timeout warnings stay visible.
         """
+        if live_stage in _LIVE_STAGES:
+            return progress.spin(label, fn, *args, **kwargs)
         return fn(*args, **kwargs)
 
     def _timeout_watcher(self, label: str, timeout: float,
@@ -287,7 +322,9 @@ class Engine:
     def _beaver_payload(self, cs: ChatSet, *, extra: dict | None = None) -> dict:
         payload = {
             "session_id": cs.session_id,
+            "chatset_id": cs.chatset_id,
             "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "chatset_hash": cs.chatset_hash,
             "raw_chat_set": cs.raw_chat_set,
         }
         if extra:
@@ -318,37 +355,24 @@ class Engine:
         model = self.client.model_for(stage)
         self.log.start(stage, session=sid, chatset=n, model=model,
                        detail=f"chars={cs.chars} hash={cs.chatset_hash[:16]}…")
-        
-        # Print step line status during execution
-        self._print(f"  -[{stage.upper()}]- Running. . . . . . .")
-        
+
         t0 = time.monotonic()
-        spinner_label = f"{stage} {sid} CS{n} {model}"
-        # ---- Spinner — in-place cycling character, freezes at final elapsed ----
-        is_stage1 = stage in ("distiller", "introbeaver", "planbeaver", "outrobeaver")
-        stop_event = threading.Event()
-        spinner = None
-        if is_stage1:
-            _SPINNER = "⠋⠙⠸⠴⠦⠇"
-            def spin():
-                i = 0
-                while not stop_event.wait(0.1):
-                    line = f"\r  [{_SPINNER[i % len(_SPINNER)]}] {stage}"
-                    sys.stdout.write(line)
-                    sys.stdout.flush()
-                    i += 1
-            spinner = threading.Thread(target=spin, daemon=True)
-            spinner.start()
-        watcher = None
-        if not is_stage1:
-            self._watch_start = t0
-            watcher = threading.Thread(
-                target=self._timeout_watcher,
-                args=(spinner_label, self.client.timeout, stop_event),
-                daemon=True,
-            )
-            watcher.start()
-        try:
+        spinner_label = f"{stage} {sid} CS{cs.source_chunk_id or n} {model}"
+        is_stage1 = stage in _LIVE_STAGES
+        if stage == "distiller" and self._print is progress.emit:
+            # Show the distiller's processing steps on a ~30 s cadence while
+            # the single LLM call runs underneath.
+            prog = progress.DistillerProgress(target=30.0)
+            prog.start()
+            try:
+                res = self.client.call_stage(
+                    stage, session_id=sid, chatset_id=cs.chatset_id,
+                    chunk=chunk, contracts=contracts, payload=payload,
+                    expected_hash=cs.chatset_hash,
+                )
+            finally:
+                prog.finish()
+        elif is_stage1:
             res = self._with_spinner(
                 spinner_label,
                 self.client.call_stage,
@@ -356,12 +380,30 @@ class Engine:
                 chunk=chunk, contracts=contracts, payload=payload,
                 expected_hash=cs.chatset_hash if stage in
                 ("distiller", "introbeaver") else None,
+                live_stage=stage,
             )
-        finally:
-            stop_event.set()
-            if spinner:
-                spinner.join(timeout=1.0)
-            if watcher:
+        else:
+            # Timeout watcher for non-stage1
+            self._watch_start = t0
+            stop_event = threading.Event()
+            watcher = threading.Thread(
+                target=self._timeout_watcher,
+                args=(spinner_label, self.client.timeout, stop_event),
+                daemon=True,
+            )
+            watcher.start()
+            try:
+                res = self._with_spinner(
+                    spinner_label,
+                    self.client.call_stage,
+                    stage, session_id=sid, chatset_id=cs.chatset_id,
+                    chunk=chunk, contracts=contracts, payload=payload,
+                    expected_hash=cs.chatset_hash if stage in
+                    ("distiller", "introbeaver") else None,
+                    live_stage=stage,
+                )
+            finally:
+                stop_event.set()
                 watcher.join(timeout=0.5)
         rec, gate = res.record, res.record.gate or GateResult(skipped=False, verdict="UNKNOWN", reasons=["Stage exhausted"], errors=[], parsed=None)
         latency = (time.monotonic() - t0) * 1000
@@ -373,7 +415,7 @@ class Engine:
         # ── Debug event writing ─────────────────────────
         if self._debug_dir:
             try:
-                from .debug_dashboard import write_event
+                from .debug_dashboard_skeu import write_event
                 import traceback
 
                 status = rec.status
@@ -411,7 +453,9 @@ class Engine:
                 write_event(self._debug_dir, ev)
             except Exception as e:
                 traceback.print_exc()
-                print(f"WARNING: debug event write failed: {e}")
+                # Route through _print so this never writes to stdout while a
+                # stage spinner owns the live line (progress.emit defers it).
+                self._print(f"WARNING: debug event write failed: {e}")
         if is_done(gate):
             self.ck.cs_mark(sid, n, stage, DONE,
                             verdict=gate.verdict or None,
@@ -448,11 +492,17 @@ class Engine:
                 if stage == "distiller":
                     self._bridge.write_receptor(
                         sid, cs.chatset_id, n, gate, rec.model, latency)
+                    dcounts = self._bridge.write_distilled(
+                        sid, cs.chatset_id, n, gate, rec.model, latency)
+                    self._log_summary(stage, sid, dcounts, chatset=n)
                 elif stage in ("introbeaver", "planbeaver", "outrobeaver"):
                     counts = self._bridge.write_intro_plan_outrobeaver(
                         sid, cs.chatset_id, stage, gate, rec.model, latency)
                     self._log_summary(stage, sid, counts, chatset=n)
                 self._soma._persist()
+            if stage == "distiller":
+                self._print(progress.distiller_summary(
+                    self._soma.path, gate.parsed))
             return True
         if is_hard_block(gate):
             self.ck.cs_mark(sid, n, stage, BLOCKED,
@@ -461,7 +511,7 @@ class Engine:
             self.log.block(stage, session=sid, chatset=n,
                            detail=f"verdict={gate.verdict} models={len(rec.attempts)}")
             self._print(f"  -[{stage.upper()}]- [BLOCKED]")
-            self._print(f"  model={rec.model or 'N/A'} chars_in={cs.chars} kept={rec.completion_tokens} dropped={rec.prompt_tokens}")
+            self._print(f"  model={rec.model or 'N/A'} chars_in={cs.chars} reason={gate.verdict or 'BLOCKED'}")
             elapsed_s = latency / 1000
             self._print(f"  Done in {elapsed_s:.0f}s")
         else:
@@ -471,7 +521,7 @@ class Engine:
             self.log.fail(stage, session=sid, chatset=n,
                           detail=f"models={len(rec.attempts)} errors={gate.reasons[:80]}")
             self._print(f"  -[{stage.upper()}]- [FAILED]")
-            self._print(f"  model={rec.model or 'N/A'} chars_in={cs.chars} kept={rec.completion_tokens} dropped={rec.prompt_tokens}")
+            self._print(f"  model={rec.model or 'N/A'} chars_in={cs.chars} reason={gate.reasons[0] if gate.reasons else 'UNKNOWN'}")
             elapsed_s = latency / 1000
             self._print(f"  Done in {elapsed_s:.0f}s")
         return False
@@ -486,21 +536,50 @@ class Engine:
             self._print(
                 f"  [{n}] {cs.chars:,} character(s) in this chatset")
 
-        # ---- Soma: SessionAnchor + ChatSet (NEW) ----
+        # ---- Soma: SessionAnchor + ChatSet + raw Messages ----
+        totals = getattr(self, "_session_totals", {}).get(sid, (1, cs.chars))
         with self._soma_lock:
             self._bridge.write_session_anchor(
                 sid, project_name="Dendritic",
-                total_sets=sum(1 for s in [cs] if s.session_id == sid),
-                total_chars=cs.chars)
+                total_sets=totals[0],
+                total_chars=totals[1])
             self._bridge.write_chatset(
                 sid, cs.chatset_id, n, cs.chars,
+                chatset_hash=cs.chatset_hash,
                 provider=cs.provider, models_used=list(cs.models))
+            self._bridge.write_raw_messages(cs)
             self._soma._persist()
 
         result: dict[str, str] = {}
 
         # Each beaver reads the raw ChatSet directly. No cross-dependencies.
-        for stage in ("distiller", "introbeaver", "planbeaver", "outrobeaver"):
+        _all_stages = ("distiller", "introbeaver", "planbeaver", "outrobeaver")
+        _run_stages = (getattr(self, "_stage", None) or "distiller")
+        _run_stages = (_run_stages,) if isinstance(_run_stages, str) else _run_stages
+
+        if self.granular:
+            self._print("\n  [Step: write SessionAnchor+ChatSet to Soma]")
+            self._print("  Enter to run, Ctrl+C to skip")
+            try:
+                input()
+            except EOFError:
+                pass
+
+        for stage in _all_stages:
+            if stage not in _run_stages:
+                continue
+            if self.granular:
+                self._print(f"\n  [Step: {stage.upper()}]")
+                self._print("  Enter to run, Ctrl+C to skip")
+                try:
+                    answer = input().strip().lower()
+                    if answer == "n" or answer == "no":
+                        self._print(f"  Skipping {stage}.")
+                        result[stage] = SKIPPED
+                        continue
+                except EOFError:
+                    pass
+                pass  # no input, will proceed
             extra = {}
             if stage == "planbeaver":
                 extra = {"codebase_context": {"existing_files": [],
@@ -518,10 +597,22 @@ class Engine:
                     "session_outcome": "PARTIAL"},
                     "user_feedback": []}
             chunk = cs.transcript() if stage == "distiller" else ""
-            ok = self._run_chatset_stage(cs, stage, worker,
-                                         payload=self._beaver_payload(cs, extra=extra),
-                                         chunk=chunk)
-            result[stage] = self.ck.cs_stage(sid, n, stage)["status"]
+            try:
+                ok = self._run_chatset_stage(
+                    cs, stage, worker,
+                    payload=self._beaver_payload(cs, extra=extra),
+                    chunk=chunk)
+            except Exception as exc:
+                detail = f"{type(exc).__name__}: {exc}"
+                self.ck.cs_mark(sid, n, stage, FAILED,
+                                model=None, chars_in=cs.chars, errors=detail)
+                self.log.fail(stage, session=sid, chatset=n, detail=detail)
+                self._print(f"  -[{stage.upper()}]- [FAILED]")
+                self._print(f"  model=N/A chars_in={cs.chars} reason={detail}")
+                result[stage] = FAILED
+                ok = False
+            else:
+                result[stage] = self.ck.cs_stage(sid, n, stage)["status"]
             if not ok and stage == "distiller":
                 # Distiller skip still marks the rest SKIPPED.
                 if self.ck.cs_stage(sid, n, "distiller")["status"] == SKIPPED:
@@ -534,18 +625,42 @@ class Engine:
     # -- stage 1 across chatsets (parallel, workers never cross sessions) ----
 
     def run_stage1(self, sessions: list[Session],
-                   only: tuple[str, int] | None = None) -> bool:
-        """Run stage1 for all (or one) chatsets. only=(session_id, set)."""
+                   only: tuple[str, int] | list[tuple[str, int]] | None = None) -> bool:
+        """Run stage1 for all chatsets, or only the selected (sid, set) pairs."""
+        # Determine which stages to run: stage="distiller" means only distiller
+        stages_to_run = ("distiller", "introbeaver", "planbeaver", "outrobeaver")
+        selected = (getattr(self, "_stage", None)
+                    or getattr(self, "_selected_stage", None))
+        if selected:
+            stages_to_run = (selected,)
+
+        # Normalise ``only`` to a set of (session_id, set_number) tuples.
+        wanted: set[tuple[str, int]] | None = None
+        if only:
+            if (isinstance(only, tuple) and len(only) == 2
+                    and isinstance(only[0], str)):
+                wanted = {only}
+            else:
+                wanted = set(only)
+
         jobs = []
         for s in sessions:
             for cs in s.chatsets:
-                if only and (cs.session_id, cs.set_number) != only:
+                if wanted is not None and (cs.session_id, cs.set_number) not in wanted:
                     continue
                 if not self.force:
+                    last = stages_to_run[-1]
                     if self.ck.cs_stage(cs.session_id, cs.set_number,
-                                        "outrobeaver")["status"] in (DONE, SKIPPED):
+                                        last)["status"] in (DONE, SKIPPED):
                         continue  # fully done, resume
                 jobs.append(cs)
+
+        # Accurate per-session totals for the SessionAnchor (not per chatset).
+        self._session_totals = {
+            s.session_id: (len(s.chatsets), sum(c.chars for c in s.chatsets))
+            for s in sessions
+        }
+
         # Apply max_chatsets limit
         if self.max_chatsets is not None and self.max_chatsets > 0 and self.max_chatsets < len(jobs):
             jobs = jobs[:self.max_chatsets]
@@ -583,6 +698,11 @@ class Engine:
                     f"Worker(s): {self.workers}")
         self._print(f"\n=== {label} -- {total_sets} chatset(s), "
                     f"{self.workers} worker(s) ===")
+
+        # Print individual chatset character counts before starting ingestion
+        for i, cs in enumerate(jobs, 1):
+            self._print(f"  Chatset {i}/{total_sets} character count: {cs.chars:,}")
+
         ok = True
         counts = {"done": 0, "failed": 0, "skipped": 0}
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
@@ -594,8 +714,7 @@ class Engine:
             for f in as_completed(futs):
                 cs = futs[f]
                 completed += 1
-                self._print(
-                    f"END chatset {completed}/{cs.total_sets} characters {cs.chars:,}")
+                self._print(f"Chatset {cs.source_chunk_id or cs.set_number} finished. Total characters: {cs.chars:,}")
                 try:
                     r = f.result()
                 except Exception as e:
@@ -617,7 +736,7 @@ class Engine:
                 # ── Debug event writing ─────────────────────────
                 if self._debug_dir:
                     try:
-                        from .debug_dashboard import write_event
+                        from .debug_dashboard_skeu import write_event
                         # Read checkpoint data for this chatset
                         ck_data = {}
                         for sn in ("distiller", "introbeaver", "planbeaver", "outrobeaver"):
@@ -699,6 +818,7 @@ class Engine:
                 stage, session_id=build, chatset_id=build,
                 chunk=chunk, contracts=contracts, payload=payload,
                 expected_hash=expected_hash,
+                live_stage=stage,
             )
         finally:
             stop_event.set()
@@ -795,7 +915,13 @@ class Engine:
         return merged
 
     def run_stages_2_4(self, build: str, sessions: list[Session],
-                       from_stage: str | None = None) -> bool:
+                       from_stage: str | None = None,
+                       step_mode: bool = False,
+                       granular: bool = False) -> bool:
+        if granular:
+            self._print("\n  [Step: Stages 2-4 build. Enter to run, Ctrl+C to skip]")
+            try: input()
+            except EOFError: pass
         merged_raw = self._merged_raw(sessions)
         h = chatset_hash_for(merged_raw)
         ctx = {"session_id": build, "chatset_id": build, "chatset_hash": h}
@@ -813,6 +939,22 @@ class Engine:
 
         stages = order[skip_to:]
         for stage in stages:
+            if self.granular:
+                self._print(f"\n  [Step: {stage.upper()} build stage]")
+                self._print("  Enter to run, Ctrl+C to skip")
+                try:
+                    answer = input().strip().lower()
+                    if answer == "n" or answer == "no":
+                        self._print(f"  Skipping {stage}.")
+                        st_status = SKIPPED
+                    else:
+                        st_status = None
+                except EOFError:
+                    st_status = None
+                if st_status == SKIPPED:
+                    self.ck.ss_stage(build, stage, st_status)
+                    self._print(f"  {stage.upper()} [SKIPPED]")
+                    continue
             self._print(f"\n=== {stage.upper()} ({build}) ===")
             if stage == "nexus":
                 payload = {"session_id": build, "chatset_id": build,
@@ -932,6 +1074,10 @@ class Engine:
                            "scout_output": sc,
                            "invariant_rules": rules}
                 if self._run_build_stage(build, "olc", payload=payload):
+                    if self.granular:
+                        self._print("\n  [Step: write codebase. Enter to run, Ctrl+C to skip]")
+                        try: input()
+                        except EOFError: pass
                     self._write_codebase(build, upstream)
             if not ok if stage == "nexus" else True:
                 pass
@@ -942,6 +1088,9 @@ class Engine:
             if st not in (DONE, SKIPPED):
                 self._print(f"  halting build at {stage}: {st}")
                 return False
+            if self.step_mode:
+                print(f"\n  [{stage.upper()} done. Press Enter for next stage...]")
+                input()
         return True
 
     def _write_codebase(self, build: str, upstream) -> None:
@@ -976,16 +1125,46 @@ class Engine:
 def run(sessions: list[Session], *, out_dir: Path,
         client: MachineTask if False else MachineTalkClient,
         workers: int = 4, from_stage: str | None = None,
-        only: tuple[str, int] | None = None, quiet: bool = False,
+        only: tuple[str, int] | list[tuple[str, int]] | None = None,
+        quiet: bool = False,
         force: bool = False,
         gateway_map: dict | None = None,
         debug_dir: str | None = None,
-        max_chatsets: int | None = None) -> int:
+        max_chatsets: int | None = None,
+        step_mode: bool = False,
+        stage: str | None = None,
+        granular: bool = False) -> int:
+    # One SOMA database per chat session. If --only targets a single
+    # session, use that session's database even when the queue has more.
+    target_session = None
+    if only:
+        pairs = ([only] if (isinstance(only, tuple) and len(only) == 2
+                            and isinstance(only[0], str)) else list(only))
+        sids = {p[0] for p in pairs}
+        if len(sids) == 1:
+            target_session = next(iter(sids))
+    if target_session:
+        soma_file = SOMAS_DIR / target_session / "soma.json"
+    elif len(sessions) == 1:
+        soma_file = SOMAS_DIR / sessions[0].session_id / "soma.json"
+    else:
+        soma_file = Path(out_dir) / "soma.json"
+
     eng = Engine(out_dir=out_dir, client=client, workers=workers,
                  quiet=quiet, force=force, gateway_map=gateway_map,
-                 debug_dir=debug_dir, max_chatsets=max_chatsets)
-    build = (sessions[0].session_id if len(sessions) == 1
-             else "project-" + "-".join(s.session_id for s in sessions))
+                 debug_dir=debug_dir, max_chatsets=max_chatsets,
+                 step_mode=step_mode, soma_path=soma_file)
+    if stage:
+        eng._stage = stage
+    eng.granular = granular
+    if len(sessions) == 1:
+        build = sessions[0].session_id
+    else:
+        # A readable concatenation of 18 session ids exceeds NAME_MAX and
+        # turns every checkpoint stat into ENAMETOOLONG. Keep it stable but
+        # short.
+        names = "|".join(s.session_id for s in sessions)
+        build = "project-" + hashlib.sha1(names.encode("utf-8")).hexdigest()[:16]
 
     # --- stage 1 -----------------------------------------------------------
     if from_stage in (None, "distiller"):
@@ -995,8 +1174,16 @@ def run(sessions: list[Session], *, out_dir: Path,
         # start mid-stage1: ensure upstream DONE for the selected chatset(s)
         pass  # run_stage1 still walks all; checkpoint guards upstream
 
-    if only:
-        # single-chatset mode: no build stages
+    if only or (max_chatsets is not None and max_chatsets > 0):
+        # A bounded stage-1 run is a chunk batch. Stages 2-4 are project-wide
+        # and must not run after one chunk.
+        return 0
+
+    if step_mode:
+        print("\n  [Press Enter to continue to stages 2-4...]")
+        input()
+
+    if stage and stage != "distiller":
         return 0
 
     # --- stages 2-4 ----------------------------------------------------------
@@ -1009,11 +1196,16 @@ def run(sessions: list[Session], *, out_dir: Path,
         build_from = None
 
     if build_from or from_stage is None:
-        ok = eng.run_stages_2_4(build, sessions, from_stage=build_from)
+        ok = eng.run_stages_2_4(build, sessions, from_stage=build_from,
+                                granular=granular)
     else:
         ok = True
 
     # final manifest
+    if granular:
+        eng._print("\n  [Step: manifest. Enter to run, Ctrl+C to skip]")
+        try: input()
+        except EOFError: pass
     header = {
         "build": build,
         "sessions": ", ".join(s.session_id for s in sessions),

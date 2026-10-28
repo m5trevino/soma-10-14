@@ -8,6 +8,19 @@ import SessionMetaPanel from './components/SessionMetaPanel'
 
 const API = '/api'
 
+// Renders a metadata value that may be a plain string or a
+// {label: count} histogram — avoids "Objects are not valid as a React child".
+function topLabel(value) {
+  if (!value) return ''
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) return String(value[0] ?? '')
+  if (typeof value === 'object') {
+    const top = Object.entries(value).sort((a, b) => (b[1] || 0) - (a[1] || 0))[0]
+    return top ? top[0] : ''
+  }
+  return String(value)
+}
+
 function App() {
   const [sessions, setSessions] = useState([])
   const [total, setTotal] = useState(0)
@@ -23,6 +36,9 @@ function App() {
       return stored ? new Set(JSON.parse(stored)) : new Set()
     } catch { return new Set() }
   })
+  
+  // Selected favorites for export (separate from the favorites collection)
+  const [exportSelected, setExportSelected] = useState(new Set())
   
   const [allFavorites, setAllFavorites] = useState([])  // full session data for favs
   const [showFavoritesPanel, setShowFavoritesPanel] = useState(false)
@@ -284,8 +300,28 @@ function App() {
       loadFavoritesData()
     } else {
       setAllFavorites([])
+      setExportSelected(new Set())
     }
   }, [showFavoritesPanel, loadFavoritesData])
+
+  // Favorites — toggle individual favorite for export
+  const toggleExportFavorite = useCallback((sessionId) => {
+    setExportSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(sessionId)) next.delete(sessionId)
+      else next.add(sessionId)
+      return next
+    })
+  }, [])
+
+  // Favorites — select all / none for export
+  const toggleAllExport = useCallback(() => {
+    if (exportSelected.size === allFavorites.length) {
+      setExportSelected(new Set())
+    } else {
+      setExportSelected(new Set(allFavorites.map((f) => f.session_id || f._session_id)))
+    }
+  }, [allFavorites, exportSelected])
 
   // Favorites — export as lean JSON
   const exportFavorites = useCallback(async () => {
@@ -299,24 +335,29 @@ function App() {
     const favoritesList = []
     for (const fav of allFavorites) {
       if (!fav.error) {
-        favoritesList.push({
-          session_id: fav.session_id,
-          provider: fav.provider || fav._session_id?.split('/')?.pop() || '',
-          total_sets: fav.total_sets || 0,
-          total_session_chars: fav.total_session_chars || 0,
-          file_count: fav.file_count || 0,
-          anchors: fav.anchors || [],
-          tool_calls: fav.tool_calls || [],
-          metadata: fav.metadata || {},
-          json_file_list: fav.json_file_list || [],
-        })
+        const sid = fav.session_id || fav._session_id
+        // Only include favorites that are checked for export
+        if (exportSelected.size === 0 || exportSelected.has(sid)) {
+          favoritesList.push({
+            session_id: fav.session_id,
+            provider: fav.provider || fav._session_id?.split('/')?.pop() || '',
+            total_sets: fav.total_sets || 0,
+            total_session_chars: fav.total_session_chars || 0,
+            file_count: fav.file_count || 0,
+            anchors: fav.anchors || [],
+            tool_calls: fav.tool_calls || [],
+            metadata: fav.metadata || {},
+            json_file_list: fav.json_file_list || [],
+          })
+        }
       }
     }
 
-    // Write queue file
+    // Write queue file with only selected session IDs
+    const selectedIds = Array.from(exportSelected) || Array.from(favorites)
     const queueData = {
-      selected: Array.from(favorites),
-      count: favorites.size,
+      selected: selectedIds,
+      count: selectedIds.length,
       timestamp: Date.now(),
     }
     try {
@@ -342,7 +383,7 @@ function App() {
     URL.revokeObjectURL(metaUrl)
     setExportStatus(`✓ Exported ${favoritesList.length} favorites to JSON`)
     setExporting(false)
-  }, [favorites, allFavorites])
+  }, [favorites, allFavorites, exportSelected])
 
   // When a row is clicked, show metadata
   const handleRowClick = useCallback((sessionId) => {
@@ -627,30 +668,58 @@ function App() {
               <span>Favorites ({allFavorites.length})</span>
               <button className="favorites-panel-close" onClick={() => setShowFavoritesPanel(false)} title="Close panel">✕</button>
             </div>
+            {allFavorites.length > 0 && (
+              <div className="favorites-panel-controls">
+                <button
+                  className="btn-select-all"
+                  onClick={toggleAllExport}
+                >
+                  {exportSelected.size === allFavorites.length ? 'Select None' : 'Select All'}
+                </button>
+                {exportSelected.size > 0 && (
+                  <span className="fav-selected-count">
+                    {exportSelected.size} selected for export
+                  </span>
+                )}
+              </div>
+            )}
             <div className="favorites-panel-body">
               {allFavorites.length === 0 ? (
                 <p className="fav-empty">No favorites yet. Select sessions and click "Add to Favorites".</p>
               ) : (
                 <div className="favorites-list">
-                  {allFavorites.map((fav, i) => (
-                    <div key={i} className="fav-item">
-                      <div className="fav-item-id">{fav.session_id?.split('/').pop() || fav._session_id?.split('/').pop()}</div>
-                      <div className="fav-item-meta">
-                        {fav.metadata?.domain && <span className="fav-badge">{fav.metadata.domain}</span>}
-                        {fav.metadata?.sentiment && <span className="fav-badge fav-sentiment">{fav.metadata.sentiment}</span>}
+                  {allFavorites.map((fav, i) => {
+                    const sid = fav.session_id || fav._session_id
+                    const checked = exportSelected.has(sid)
+                    return (
+                      <div key={i} className={`fav-item ${checked ? 'fav-item-checked' : ''}`}>
+                        <label className="fav-item-checkbox">
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => toggleExportFavorite(sid)}
+                          />
+                          <span className="fav-item-id">{sid?.split('/').pop() || sid}</span>
+                        </label>
+                        <div className="fav-item-meta">
+                          {fav.metadata?.domain && <span className="fav-badge">{topLabel(fav.metadata.domain)}</span>}
+                          {fav.metadata?.sentiment && <span className="fav-badge fav-sentiment">{topLabel(fav.metadata.sentiment)}</span>}
+                        </div>
+                        <button
+                          className="fav-remove-btn"
+                          onClick={() => {
+                            if (sid) {
+                              removeFavorite(sid)
+                              setExportSelected(prev => { const n = new Set(prev); n.delete(sid); return n })
+                            }
+                          }}
+                          title="Remove from favorites"
+                        >
+                          ✕
+                        </button>
                       </div>
-                      <button
-                        className="fav-remove-btn"
-                        onClick={() => {
-                          const sid = fav.session_id || fav._session_id
-                          if (sid) removeFavorite(sid)
-                        }}
-                        title="Remove from favorites"
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               )}
             </div>

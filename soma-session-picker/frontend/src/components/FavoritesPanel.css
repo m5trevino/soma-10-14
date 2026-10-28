@@ -1,83 +1,166 @@
-/* ── Favorites Panel ─────────────────────────────────────────────────────── */
+/* ═════════════════════════════════════════════════════════════════════
+   FAVORITES PANEL — stitched leather sidebar with metal header
+   ═════════════════════════════════════════════════════════════════════ */
 
 .favorites-panel {
   width: 360px;
   flex-shrink: 0;
-  background: #161b22;
-  border-right: 1px solid #30363d;
+  position: relative;
   display: flex;
   flex-direction: column;
+  background:
+    radial-gradient(140% 60% at 50% 0%, rgba(255, 255, 255, 0.035), transparent 60%),
+    repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.012) 0 1px, transparent 1px 5px),
+    repeating-linear-gradient(-45deg, rgba(0, 0, 0, 0.2) 0 1px, transparent 1px 5px),
+    linear-gradient(180deg, #15181d 0%, #101318 100%);
+  border-right: 2px solid #06080b;
+  box-shadow:
+    inset -10px 0 30px rgba(0, 0, 0, 0.35),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.02),
+    4px 0 18px rgba(0, 0, 0, 0.5);
+}
+
+/* Stitched seam */
+.favorites-panel::after {
+  content: '';
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  right: 7px;
+  width: 0;
+  pointer-events: none;
+  border-right: 2px dashed rgba(255, 255, 255, 0.09);
 }
 
 .favorites-panel-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 12px 14px;
-  border-bottom: 1px solid #30363d;
-  font-weight: 600;
-  font-size: 14px;
-  color: #f0f6fc;
+  padding: 13px 16px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: #aab5c2;
+  border-bottom: 2px solid #06080b;
+  background:
+    repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.02) 0 1px, transparent 1px 3px),
+    linear-gradient(180deg, #2b323c 0%, #1f252d 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.13),
+    0 3px 8px rgba(0, 0, 0, 0.4);
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.06), 0 -1px 0 rgba(0, 0, 0, 0.9);
 }
 
 .favorites-panel-close {
-  background: none;
-  border: none;
-  color: #8b949e;
-  cursor: pointer;
-  font-size: 16px;
-  padding: 0 4px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid #05070a;
+  font-size: 11px;
   line-height: 1;
+  color: #dfe7f0;
+  background: radial-gradient(circle at 35% 28%, #6b7684 0%, #454e5a 45%, #313842 70%, #1d222a 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.4),
+    inset 0 -2px 3px rgba(0, 0, 0, 0.5),
+    0 2px 4px rgba(0, 0, 0, 0.6);
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.7);
+  transition: filter 0.12s ease, transform 0.08s ease;
+}
+.favorites-panel-close:hover { filter: brightness(1.2); }
+.favorites-panel-close:active { transform: translateY(1px); }
+
+.favorites-panel-controls {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 16px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.55);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03);
 }
 
-.favorites-panel-close:hover {
-  color: #c9d1d9;
+.favorites-panel-controls .btn-select-all {
+  padding: 6px 12px;
+  font-size: 9px;
+  border-radius: 6px;
 }
 
-.favorites-panel-body {
-  flex: 1;
-  overflow-y: auto;
-  padding: 10px;
+.fav-selected-count {
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--green);
+  text-shadow: 0 0 8px var(--green-glow);
 }
 
 .fav-empty {
-  color: #8b949e;
-  font-size: 13px;
+  color: #5f6a77;
+  font-size: 12px;
   text-align: center;
-  padding: 30px 10px;
-  line-height: 1.6;
+  padding: 34px 16px;
+  line-height: 1.65;
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.8);
 }
 
 .favorites-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
+  padding: 12px 16px 16px;
 }
 
+/* ── Favorite label cards ────────────────────────────────────────── */
 .fav-item {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 10px;
-  background: #0d1117;
-  border: 1px solid #30363d;
-  border-radius: 6px;
+  gap: 9px;
+  padding: 10px 12px;
+  border-radius: 7px;
   cursor: pointer;
-  transition: border-color 0.15s;
+  border: 1px solid #06080b;
+  border-left: 3px solid rgba(255, 255, 255, 0.06);
+  background: linear-gradient(180deg, #1d2229 0%, #151a20 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 2px 6px rgba(0, 0, 0, 0.45);
+  transition: filter 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
 }
 
 .fav-item:hover {
-  border-color: #58a6ff;
+  filter: brightness(1.1);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 3px 9px rgba(0, 0, 0, 0.5);
+}
+
+.fav-item-checked {
+  border-left-color: var(--green);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    inset 0 0 18px rgba(99, 230, 160, 0.05),
+    0 2px 6px rgba(0, 0, 0, 0.45);
+}
+
+.fav-item-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
 }
 
 .fav-item-id {
   flex: 1;
-  font-size: 12px;
-  color: #c9d1d9;
+  min-width: 0;
+  font-size: 11px;
+  color: #aeb9c6;
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  min-width: 0;
 }
 
 .fav-item-meta {
@@ -86,76 +169,61 @@
   flex-shrink: 0;
 }
 
+/* ── Enamel badges ───────────────────────────────────────────────── */
 .fav-badge {
-  font-size: 10px;
-  padding: 2px 6px;
-  border-radius: 10px;
-  background: #1f6feb22;
-  color: #58a6ff;
-  border: 1px solid #1f6feb44;
+  position: relative;
+  overflow: hidden;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: 9px;
   white-space: nowrap;
+  color: #cfe4ff;
+  background: linear-gradient(180deg, #2f5f8f 0%, #234a72 100%);
+  border: 1px solid #0a1521;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.25),
+    0 1px 2px rgba(0, 0, 0, 0.5);
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.5);
+}
+
+.fav-badge::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 50%;
+  border-radius: 9px 9px 20px 20px / 9px 9px 8px 8px;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.22), transparent);
 }
 
 .fav-sentiment {
-  background: #a371f722;
-  color: #bc8cff;
-  border-color: #a371f744;
+  color: #f4e6c8;
+  background: linear-gradient(180deg, #8a6a2c 0%, #6b4f1e 100%);
+  border-color: #1b1408;
 }
 
 .fav-remove-btn {
-  background: none;
-  border: none;
-  color: #484f58;
-  cursor: pointer;
-  font-size: 14px;
-  padding: 2px 6px;
-  border-radius: 4px;
   flex-shrink: 0;
   line-height: 1;
+  font-size: 11px;
+  padding: 3px 7px;
+  border-radius: 5px;
+  color: #97a3b1;
+  border: 1px solid #05070a;
+  background: linear-gradient(180deg, #333a45 0%, #242a33 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    0 1px 2px rgba(0, 0, 0, 0.5);
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.6);
+  transition: filter 0.12s ease, color 0.12s ease;
 }
-
 .fav-remove-btn:hover {
-  background: #da363322;
-  color: #f85149;
+  filter: brightness(1.18);
+  color: #ffb3b3;
 }
-
-/* ── Header Buttons ─────────────────────────────────────────────────────── */
-
-.btn-add-fav {
-  background: #1f6feb;
-  color: #fff;
-  border: none;
-  border-radius: 6px;
-  padding: 6px 12px;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: background 0.15s;
-}
-
-.btn-add-fav:hover {
-  background: #388bfd;
-}
-
-.btn-export-fav {
-  background: #238636;
-  color: #fff;
-  border: none;
-  border-radius: 6px;
-  padding: 6px 12px;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: background 0.15s;
-}
-
-.btn-export-fav:hover:not(:disabled) {
-  background: #2ea043;
-}
-
-.btn-export-fav:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
+.fav-remove-btn:active { transform: translateY(1px); }

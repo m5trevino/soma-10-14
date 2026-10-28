@@ -1,14 +1,29 @@
 """Clean table-based progress output for Stage 1 ingestion.
 
+While a stage runs → one live line, rewritten in place with a spinning
+character and elapsed seconds, frozen with a single newline when it ends.
 After each chatset finishes → print header → divider → table → divider.
 After all chatsets → summary.
 
-No spinners, no interleaved logs, no live dashboard.
+No interleaved logs, no live dashboard.
 """
 from __future__ import annotations
 
+import sys
+import threading
+import time
+
 
 # ── Primitives ──────────────────────────────────────────────────────────
+
+# ANSI styling for the dressed-up stage output. Always emitted so the
+# launcher's terminal (which re-prints captured lines) still renders it.
+_C_RESET = "\033[0m"
+_C_BOLD = "\033[1m"
+_C_DIM = "\033[2m"
+_C_CYAN = "\033[36m"
+_C_GREEN = "\033[32m"
+_C_YELLOW = "\033[33m"
 
 _DIVIDER = ("■□■□■□■□■□■□■□■■□■□■□■□■□■□■□■■□■□■□■□■□■□■□"
             "■■□■□■□■□■□■□■□■■□■□■□■□■□■□■□■■□■□■□■□■□■□■□"
@@ -246,3 +261,237 @@ def session_summary(done: int, failed: int, skipped: int, total: int) -> str:
     bot = "╚══════════•⊱✦⊰•══════════╝"
     line = f"   DONE: {done}  FAILED: {failed}  SKIPPED: {skipped}  TOTAL: {total}"
     return f"\n{top}\n{line}\n{bot}\n"
+
+
+# ── Live stage line ─────────────────────────────────────────────────────
+#
+# Exactly one running stage owns the terminal line. The owner rewrites that
+# line in place with a carriage return (spinner glyph + elapsed seconds) and
+# freezes it with a single newline when the stage returns. Stage 1 runs on
+# several worker threads, so extra spinners stay silent rather than fighting
+# for the line, and ordinary output is queued until the line is free.
+
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_SPINNER_TICK = 0.1
+_FROZEN_GLYPH = "✓"
+
+_io_lock = threading.RLock()
+_active_line: "_LiveLine | None" = None
+_deferred: list[tuple[tuple, dict]] = []
+
+
+class _LiveLine:
+    """One spinner line, owned by at most one stage at a time."""
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self._started = time.monotonic()
+        self._stop = threading.Event()
+        self._thread: "threading.Thread | None" = None
+        self._owns = False
+        self._width = 0
+
+    def open(self) -> None:
+        global _active_line
+        with _io_lock:
+            self._owns = _active_line is None
+            if self._owns:
+                _active_line = self
+        if not self._owns:
+            return
+        self._thread = threading.Thread(
+            target=self._spin, daemon=True, name="stage-spinner")
+        self._thread.start()
+
+    def _spin(self) -> None:
+        frames = _SPINNER_FRAMES
+        idx = 0
+        while True:
+            self._draw(frames[idx % len(frames)])
+            idx += 1
+            if self._stop.wait(_SPINNER_TICK):
+                return
+
+    def _elapsed(self) -> int:
+        return int(time.monotonic() - self._started)
+
+    def _draw(self, glyph: str) -> None:
+        body = f"  {glyph} {self.label}... {self._elapsed()}s"
+        padding = " " * max(0, self._width - len(body))
+        self._width = len(body)
+        with _io_lock:
+            sys.stdout.write("\r" + body + padding)
+            sys.stdout.flush()
+
+    def close(self) -> None:
+        global _active_line
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        if not self._owns:
+            return
+        # Freeze the final elapsed value on the same line, then end the line.
+        self._draw(_FROZEN_GLYPH)
+        with _io_lock:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            if _active_line is self:
+                _active_line = None
+        _flush_deferred()
+
+
+def _flush_deferred() -> None:
+    """Print output queued while a spinner owned the line."""
+    while True:
+        with _io_lock:
+            if _active_line is not None or not _deferred:
+                return
+            args, kwargs = _deferred.pop(0)
+            print(*args, **kwargs)
+
+
+def emit(*args, **kwargs) -> None:
+    """Print normally, or queue while a stage spinner owns the line."""
+    with _io_lock:
+        if _active_line is not None:
+            _deferred.append((args, kwargs))
+            return
+        print(*args, **kwargs)
+
+
+def spin(label: str, fn, *args, **kwargs):
+    """Run ``fn`` behind a one-line spinner showing elapsed seconds."""
+    line = _LiveLine(label)
+    line.open()
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        line.close()
+
+
+# ── Distiller step display ──────────────────────────────────────────────
+#
+# The distiller's 11 processing steps (tb-001) all happen inside one LLM
+# call, so there is no natural per-step signal to print. This shows each
+# step on a ~30 s cadence (randomized durations) so the operator can see
+# what the call is doing, then heartbeats until the call returns.
+
+_DISTILLER_STEPS = [
+    "hashing input",
+    "extracting heredocs, metadata, constraints",
+    "stripping noise: greetings, apologies, fillers, fences",
+    "checking for duplicate hashes",
+    "last user statement = current goal",
+    "classifying signals into graph data",
+    "matching intent across turns",
+    "logging noise purges + stats",
+    "computing overall signal quality",
+    "verdict: pass | skip | quarantine",
+    "writing canonical payload",
+]
+
+
+class DistillerProgress:
+    """Dressed-up step-by-step display for one distiller call."""
+
+    def __init__(self, target: float = 30.0) -> None:
+        self._target = max(1.0, float(target))
+        self._stop = threading.Event()
+        self._steps_done = threading.Event()
+        self._thread: "threading.Thread | None" = None
+        self._started = 0.0
+
+    def start(self) -> None:
+        self._started = time.monotonic()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="distiller-steps")
+        self._thread.start()
+
+    def _run(self) -> None:
+        import random
+
+        n = len(_DISTILLER_STEPS)
+        weights = [random.uniform(0.45, 1.55) for _ in range(n)]
+        scale = self._target / sum(weights)
+        width = max(len(s) for s in _DISTILLER_STEPS) + 2
+
+        for i, (step, w) in enumerate(zip(_DISTILLER_STEPS, weights), start=1):
+            dur = w * scale
+            if self._stop.wait(dur):
+                return
+            dots = "." * max(3, width - len(step))
+            with _io_lock:
+                print(
+                    f"  {_C_GREEN}✓{_C_RESET} "
+                    f"{_C_DIM}[{i:02d}/{n}]{_C_RESET} "
+                    f"{_C_CYAN}{step}{_C_RESET} {_C_DIM}{dots} {dur:>4.1f}s{_C_RESET}",
+                    flush=True,
+                )
+
+        self._steps_done.set()
+
+        # Steps are exhausted but the model may still be running.
+        while not self._stop.wait(5.0):
+            elapsed = time.monotonic() - self._started
+            with _io_lock:
+                print(
+                    f"  {_C_DIM}… awaiting model response ({elapsed:.0f}s){_C_RESET}",
+                    flush=True,
+                )
+
+    def finish(self) -> None:
+        """Let the dressed-up output run through all steps, then stop."""
+        self._steps_done.wait()
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=6.0)
+
+
+# ── Distiller result summary ────────────────────────────────────────────
+
+def _fmt_bytes(n) -> str:
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "—"
+    if n >= 1024:
+        return f"{n / 1024:.1f}KB"
+    return f"{n}B"
+
+
+def distiller_summary(soma_path, parsed) -> str:
+    """Render the SOMA DB path plus a few distiller processing stats."""
+    parsed = parsed or {}
+
+    def _count(key: str) -> int:
+        v = parsed.get(key)
+        if isinstance(v, (list, tuple)):
+            return len(v)
+        return int(v) if isinstance(v, int) else 0
+
+    sigq = parsed.get("signal_quality")
+    ns = parsed.get("noise_signature") or {}
+    noise_b = ns.get("total_bytes_noise", 0)
+    signal_b = ns.get("total_bytes_signal", 0)
+    intent = str(parsed.get("intent") or "").strip()
+    verdict = "SKIP" if parsed.get("skip") else "PASS"
+
+    parts = [f"  {_C_BOLD}SOMA DB{_C_RESET}  {soma_path}"]
+    if intent:
+        parts.append(f"  {_C_BOLD}intent{_C_RESET}   {intent[:100]}")
+    if isinstance(sigq, (int, float)):
+        parts.append(
+            f"  {_C_BOLD}signal quality{_C_RESET}  {sigq:.2f}   "
+            f"{_C_DIM}noise {_fmt_bytes(noise_b)} / signal {_fmt_bytes(signal_b)}{_C_RESET}"
+        )
+    skip_reason = str(parsed.get("skip_reason") or "").strip()
+    if skip_reason:
+        parts.append(f"  {_C_BOLD}skip reason{_C_RESET}  {skip_reason}")
+    parts.append(
+        f"  {_C_BOLD}directives{_C_RESET} {_count('directives')}   "
+        f"{_C_BOLD}constraints{_C_RESET} {_count('constraints')}   "
+        f"{_C_BOLD}preferences{_C_RESET} {_count('preferences')}   "
+        f"{_C_BOLD}questions{_C_RESET} {_count('questions')}   "
+        f"{_C_BOLD}verdict{_C_RESET} {_C_GREEN if verdict == 'PASS' else _C_YELLOW}{verdict}{_C_RESET}"
+    )
+    return "\n".join(parts)

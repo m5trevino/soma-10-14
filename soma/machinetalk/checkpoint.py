@@ -86,15 +86,21 @@ def _atomic_write(path: Path, obj) -> None:
 
 
 class CheckpointStore:
-    def __init__(self, out_dir: Path) -> None:
+    def __init__(self, out_dir: Path, layout: str = "group") -> None:
         self.out_dir = Path(out_dir)
         self.dir = self.out_dir / "checkpoints"
+        self.layout = layout
         self._cache: dict[str, dict] = {}
 
     # -- io ----------------------------------------------------------------
 
     def _path(self, session_id: str) -> Path:
-        return self.dir / f"{session_id}.checkpoint.json"
+        # Chunk-layout checkpoints are separate from the old set_number-group
+        # checkpoints so existing group state cannot skip a chunk. The old
+        # file is left untouched.
+        suffix = ".chunks.checkpoint.json" if self.layout == "chunk" \
+            else ".checkpoint.json"
+        return self.dir / f"{session_id}{suffix}"
 
     def load(self, session_id: str) -> dict:
         if session_id in self._cache:
@@ -102,9 +108,11 @@ class CheckpointStore:
         p = self._path(session_id)
         if p.exists():
             data = json.loads(p.read_text())
+            data.setdefault("layout", self.layout)
         else:
-            data = {"session_id": session_id, "chatsets": {},
-                    "session_stages": {}, "updated_at": _now()}
+            data = {"session_id": session_id, "layout": self.layout,
+                    "chatsets": {}, "session_stages": {},
+                    "updated_at": _now()}
         self._cache[session_id] = data
         return data
 

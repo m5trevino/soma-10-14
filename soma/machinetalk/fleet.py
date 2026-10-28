@@ -50,18 +50,18 @@ class FleetPrompt:
 
 
 FLEET: list[FleetPrompt] = [
-    FleetPrompt("distiller",   "tb-001", "tb-001-distiller.md",   "", True,  "{chunk}",          "[RAW_CHAT_TRANSCRIPT]"),
-    FleetPrompt("introbeaver", "tb-004", "tb-004-introbeaver.md", "", True,  "",                "[EXTRACTION_PAYLOAD]"),
-    FleetPrompt("planbeaver",  "tb-005", "tb-005-planbeaver.md",  "", True,  "",                "[EXTRACTION_PAYLOAD]"),
-    FleetPrompt("outrobeaver", "tb-006", "tb-006-outrobeaver.md", "", True,  "",                "[EXTRACTION_PAYLOAD]"),
-    FleetPrompt("nexus",       "tb-007", "tb-007-nexus.md",       "", True,  "",                "[NEXUS_PAYLOAD]"),
-    FleetPrompt("spark",       "tb-008", "tb-008-spark.md",       "", True,  "",                "[NEXUS_PAYLOAD]"),
-    FleetPrompt("falcon",      "tb-009", "tb-009-falcon.md",      "", True,  "",                "[FALCON_PAYLOAD]"),
-    FleetPrompt("eagle",       "tb-010", "tb-010-eagle.md",       "", True,  "{chunk}",         "[FALCON_PAYLOAD]"),
-    FleetPrompt("drafter",     "tb-011", "tb-011-drafter.md",     "", True,  "",                "[DRAFTING_PAYLOAD]"),
-    FleetPrompt("scout",       "tb-012", "tb-012-scout.md",       "", True,  "{chunk}",         "[DNA_CONTRACTS]"),
-    FleetPrompt("oc",          "tb-013", "tb-013-oc.md",          "", True,  "",                "[REVIEW_PAYLOAD]"),
-    FleetPrompt("olc",         "tb-014", "tb-014-olc.md",         "", True,  "",                "[APPROVED_PAYLOAD]"),
+    FleetPrompt("distiller",   "tb-001", "tb-001-distiller.v2.md",   "", True,  "{chunk}",          "[RAW_CHAT_TRANSCRIPT]"),
+    FleetPrompt("introbeaver", "tb-004", "tb-004-introbeaver.v2.md", "", True,  "",                "[EXTRACTION_PAYLOAD]"),
+    FleetPrompt("planbeaver",  "tb-005", "tb-005-planbeaver.v2.md",  "", True,  "",                "[EXTRACTION_PAYLOAD]"),
+    FleetPrompt("outrobeaver", "tb-006", "tb-006-outrobeaver.v2.md", "", True,  "",                "[EXTRACTION_PAYLOAD]"),
+    FleetPrompt("nexus",       "tb-007", "tb-007-nexus.v2.md",       "", True,  "",                "[NEXUS_PAYLOAD]"),
+    FleetPrompt("spark",       "tb-008", "tb-008-spark.v2.md",       "", True,  "",                "[NEXUS_PAYLOAD]"),
+    FleetPrompt("falcon",      "tb-009", "tb-009-falcon.v2.md",      "", True,  "",                "[FALCON_PAYLOAD]"),
+    FleetPrompt("eagle",       "tb-010", "tb-010-eagle.v2.md",       "", True,  "{chunk}",         "[FALCON_PAYLOAD]"),
+    FleetPrompt("drafter",     "tb-011", "tb-011-drafter.v2.md",     "", True,  "",                "[DRAFTING_PAYLOAD]"),
+    FleetPrompt("scout",       "tb-012", "tb-012-scout.v2.md",       "", True,  "{chunk}",         "[DNA_CONTRACTS]"),
+    FleetPrompt("oc",          "tb-013", "tb-013-oc.v2.md",          "", True,  "",                "[REVIEW_PAYLOAD]"),
+    FleetPrompt("olc",         "tb-014", "tb-014-olc.v2.md",         "", True,  "",                "[APPROVED_PAYLOAD]"),
 ]
 
 _BY_STAGE = {p.stage: p for p in FLEET}
@@ -101,10 +101,10 @@ def load_system_prompt(stage: str, fleet_dir: Path | None = None,
     """
     fleet_dir = fleet_dir or FLEET_DIR
     p = get_prompt(stage)
-    base = (fleet_dir / "tb-003-system-base.md").read_text().rstrip()
+    base = (fleet_dir / "tb-003-system-base.v2.md").read_text().rstrip()
     parts = [base]
     if p.handoff:
-        proto = (fleet_dir / "tb-002-pipeline-protocol.md").read_text().rstrip()
+        proto = (fleet_dir / "tb-002-pipeline-protocol.v2.md").read_text().rstrip()
         parts.append(proto)
     # Load the actual stage prompt body from disk if not already cached
     body = p.body

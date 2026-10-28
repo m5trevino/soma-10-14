@@ -244,7 +244,8 @@ def run_pipeline(paths: list[str], full_objects: list[dict] | None = None,
     if full_objects:
         domains = set()
         sentiments = set()
-        topics_count = 0
+        chatsets_count = 0
+        chars_count = 0
         for obj in full_objects:
             md = obj.get("metadata", {})
             if isinstance(md, dict):
@@ -254,15 +255,19 @@ def run_pipeline(paths: list[str], full_objects: list[dict] | None = None,
                 s = md.get("sentiment", "")
                 if s:
                     sentiments.add(s)
-                topics = md.get("topics", [])
-                if isinstance(topics, list):
-                    topics_count += len(topics)
+                chatsets = md.get("chatsets", [])
+                if isinstance(chatsets, list):
+                    chatsets_count += len(chatsets)
+                chars = md.get("chars", 0)
+                if isinstance(chars, (int, float)):
+                    chars_count += chars
         if domains:
             print(f"  Domains:   {', '.join(sorted(domains))}")
         if sentiments:
             print(f"  Sentiments: {', '.join(sorted(sentiments))}")
-        if topics_count:
-            print(f"  Total topics across sessions: {topics_count}")
+        if chatsets_count or chars_count:
+            print(f"  Total chatsets: {chatsets_count}")
+            print(f"  Total characters: {chars_count}")
     print()
 
     # Start dashboard
