@@ -1,0 +1,331 @@
+tracer_bullets:
+
+  - slice_id: s01-distiller-load-and-chunk
+    name: "S01 -- Distiller: load raw chat, chunk into chatset, write to disk (NO hash, NO checkpoint, NO engine)"
+    objective: |
+      Start in /home/flintx/soma-10-14.
+      Read session_id from /tmp/soma_test_session_id.txt.
+      Load raw chat messages for that session from SOMA DB using soma/store.py.
+      Chunk them into a chatset using the logic in soma/distiller.py -- list of dict objects each with role, content, timestamp.
+      Write the chatset to /tmp/soma_distiller_chatset.json.
+      Print the message count to stdout.
+      STOP. Do nothing else.
+    scope: soma/distiller.py, soma/store.py
+    acceptance_criteria:
+      - "Chatset written to /tmp/soma_distiller_chatset.json as valid JSON array"
+      - "Each dict has role, content, timestamp keys"
+      - "Chatset length matches DB query result"
+      - "Message count printed to stdout"
+      - "NO hash computation performed"
+      - "NO checkpoint written"
+      - "NO engine/LLM calls made"
+      - "No other files modified"
+    hard_gates:
+      - no_hash_computed
+      - no_checkpoint
+      - no_llm_calls
+      - nonce_echo_required
+
+  - slice_id: s02-distiller-hash-and-persist
+    name: "S02 -- Distiller: compute chatset_hash, store chatset+hash in DB, write checkpoint DONE (NO engine, NO progress render)"
+    objective: |
+      Start in /home/flintx/soma-10-14.
+      Read /tmp/soma_distiller_chatset.json.
+      Call chatset_hash_for() from soma/machinetalk/hashes.py to compute canonical JSON hash.
+      Store the chatset + hash in the SOMA DB chatset table.
+      Write a checkpoint for stage "distiller" with status DONE and the computed hash.
+      Print: CHATSET_HASH: <value>
+      STOP. Do nothing else.
+    scope: soma/machinetalk/hashes.py, soma/machinetalk/checkpoint.py, soma/store.py
+    acceptance_criteria:
+      - "Hash computed via chatset_hash_for()"
+      - "Chatset + hash stored in SOMA DB"
+      - "Checkpoint written: stage=distiller, status=DONE"
+      - "Hash printed as CHATSET_HASH: <value>"
+      - "NO engine/LLM calls made"
+      - "No progress rendering"
+      - "Re-running produces same hash"
+    hard_gates:
+      - no_llm_calls
+      - no_progress_render
+      - checkpoint_status_is_DONE
+      - hash_deterministic
+      - nonce_echo_required
+
+  - slice_id: s03-introbeaver-build-payload
+    name: "S03 -- Intro Beaver: build EXTRACTED_SESSION payload dict from chatset, write to disk (NO engine call, NO checkpoint)"
+    objective: |
+      Start in /home/flintx/soma-10-14.
+      Read /tmp/soma_distiller_chatset.json.
+      Build a machine-talk payload dict with: session_id, chatset_id, chatset_hash, raw_chat_set, EXTRACTED_SESSION marker.
+      Compute chatset_hash via chatset_hash_for().
+      Write payload to /tmp/soma_introbeaver_payload.json.
+      STOP. Do nothing else.
+    scope: soma/machinetalk/fleet.py (make_payload), soma/machinetalk/hashes.py
+    acceptance_criteria:
+      - "Payload written to /tmp/soma_introbeaver_payload.json"
+      - "Contains session_id, chatset_id, chatset_hash, raw_chat_set keys"
+      - "Valid JSON, parseable"
+      - "NO engine call made"
+      - "NO checkpoint written"
+    hard_gates:
+      - no_engine_call
+      - no_checkpoint
+      - payload_is_valid_json
+      - nonce_echo_required
+
+  - slice_id: s04-introbeaver-call-engine
+    name: "S04 -- Intro Beaver: call engine with tb-004-introbeaver prompt + payload, parse response, write entities to disk (NO graph store, NO checkpoint)"
+    objective: |
+      Start in /home/flintx/soma-10-14.
+      Read /tmp/soma_introbeaver_payload.json.
+      Load tb-004-introbeaver system prompt via fleet.load_system_prompt("introbeaver").
+      Call engine via soma/machinetalk/engine.py with that system prompt + payload as user message.
+      Parse JSON response into: Persons (list), Orgs (list), Documents (list), Events (list).
+      Write each entity list to separate files: /tmp/soma_introbeaver_persons.json etc.
+      On failure (bad JSON/exception): write /tmp/soma_introbeaver_error.txt with error details.
+      STOP. Do nothing else.
+    scope: soma/machinetalk/engine.py, soma/machinetalk/fleet.py
+    acceptance_criteria:
+      - "Engine call made with tb-004-introbeaver system prompt"
+      - "Each entity type written to its own JSON file in /tmp/"
+      - "On failure: error file exists"
+      - "At least one entity type has > 0 items (or error file)"
+      - "NO graph store calls"
+      - "NO checkpoint written"
+    hard_gates:
+      - engine_call_logged
+      - response_persisted_to_files
+      - no_graph_store
+      - no_checkpoint
+      - nonce_echo_required
+
+  - slice_id: s05-introbeaver-store-to-graph
+    name: "S05 -- Intro Beaver: create Neo4j nodes for all entities (NO engine call, NO checkpoint)"
+    objective: |
+      Start in /home/flintx/soma-10-14.
+      Read entity files from /tmp/soma_introbeaver_{persons,orgs,documents,events}.json.
+      For each entity, create a Neo4j node with properties: session_id, entity_type, entity_name, content.
+      Use soma/nexus_dendrite.py or soma/store.py for node creation.
+      STOP. Do nothing else.
+    scope: soma/nexus_dendrite.py, soma/store.py
+    acceptance_criteria:
+      - "Neo4j node created for each entity"
+      - "Each node has session_id, entity_type, entity_name, content props"
+      - "NO engine/LLM calls"
+      - "NO checkpoint written"
+    hard_gates:
+      - no_llm_calls
+      - no_checkpoint
+      - nodes_exist_in_graph
+      - nonce_echo_required
+
+  - slice_id: s06-introbeaver-checkpoint-done
+    name: "S06 -- Intro Beaver: compute extraction_hash, write checkpoint DONE, print hash (NO graph writes, NO progress render)"
+    objective: |
+      Start in /home/flintx/soma-10-14.
+      Read all 4 entity JSON files from /tmp/.
+      Compute extraction_hash = canonical_json of all entity lists combined.
+      Write checkpoint for "introbeaver" with status DONE and extraction_hash.
+      Print: EXTRACTION_HASH: <value>
+      STOP. Do nothing else.
+    scope: soma/machinetalk/checkpoint.py, soma/machinetalk/hashes.py, soma/machinetalk/fleet.py
+    acceptance_criteria:
+      - "Checkpoint: stage=introbeaver, status=DONE, extraction_hash=<value>"
+      - "Hash printed as EXTRACTION_HASH: <value>"
+      - "NO graph writes"
+      - "NO progress rendering"
+      - "Hash matches canonical_json of entities"
+    hard_gates:
+      - no_llm_calls
+      - no_entity_writes
+      - no_progress_render
+      - checkpoint_status_is_DONE
+      - nonce_echo_required
+
+  - slice_id: s07-planbeaver-build-payload
+    name: "S07 -- Plan Beaver: build payload from extraction + raw chatset, write to disk (NO engine call, NO checkpoint)"
+    objective: |
+      Start in /home/flintx/soma-10-14.
+      Read /tmp/soma_introbeaver_payload.json and /tmp/soma_distiller_chatset.json.
+      Build combined payload: session_id, chatset_hash, extraction (entity lists), raw_chat_set.
+      Write to /tmp/soma_planbeaver_payload.json.
+      STOP. Do nothing else.
+    scope: soma/machinetalk/fleet.py, soma/machinetalk/hashes.py
+    acceptance_criteria:
+      - "Payload written to /tmp/soma_planbeaver_payload.json"
+      - "Contains session_id, chatset_hash, extraction, raw_chat_set"
+      - "Valid JSON"
+      - "NO engine call"
+      - "NO checkpoint"
+    hard_gates:
+      - no_engine_call
+      - no_checkpoint
+      - payload_is_valid_json
+      - nonce_echo_required
+
+  - slice_id: s08-planbeaver-call-engine
+    name: "S08 -- Plan Beaver: call engine with tb-005-planbeaver prompt + payload, parse plan into structured items, write to disk (NO graph store, NO checkpoint)"
+    objective: |
+      Start in /home/flintx/soma-10-14.
+      Read /tmp/soma_planbeaver_payload.json.
+      Load tb-005-planbeaver system prompt.
+      Call engine with system prompt + payload.
+      Parse response into plan items: list of dicts with type, description, priority, dependencies.
+      Write to /tmp/soma_planbeaver_plan.json.
+      On failure: write /tmp/soma_planbeaver_error.txt.
+      STOP. Do nothing else.
+    scope: soma/machinetalk/engine.py, soma/machinetalk/fleet.py
+    acceptance_criteria:
+      - "Engine call with tb-005-planbeaver prompt"
+      - "Response parsed into plan items with type, description, priority, dependencies"
+      - "Plan written to /tmp/soma_planbeaver_plan.json"
+      - "On failure: error file written"
+      - "NO graph store"
+      - "NO checkpoint"
+    hard_gates:
+      - engine_call_logged
+      - response_persisted
+      - no_graph_store
+      - no_checkpoint
+      - nonce_echo_required
+
+  - slice_id: s09-planbeaver-store-to-graph
+    name: "S09 -- Plan Beaver: store plan items as DirectivePlanNodes in Neo4j (NO engine call, NO checkpoint)"
+    objective: |
+      Start in /home/flintx/soma-10-14.
+      Read plan items from /tmp/soma_planbeaver_plan.json.
+      Create Neo4j DirectivePlanNodes, one per plan item, with: session_id, plan_item_type, description, priority, dependencies.
+      STOP. Do nothing else.
+    scope: soma/nexus_dendrite.py, soma/store.py
+    acceptance_criteria:
+      - "One Neo4j node per plan item"
+      - "Nodes have correct props"
+      - "NO engine calls"
+      - "NO checkpoint"
+    hard_gates:
+      - no_llm_calls
+      - no_checkpoint
+      - nodes_exist_in_graph
+      - node_count_matches
+      - nonce_echo_required
+
+  - slice_id: s10-planbeaver-checkpoint-done
+    name: "S10 -- Plan Beaver: compute plan_hash, write checkpoint DONE, print hash (NO graph writes, NO engine, NO render)"
+    objective: |
+      Start in /home/flintx/soma-10-14.
+      Compute plan_hash = canonical_json of /tmp/soma_planbeaver_plan.json.
+      Write checkpoint "planbeaver" DONE with plan_hash.
+      Print: PLAN_HASH: <value>
+      STOP. Do nothing else.
+    scope: soma/machinetalk/checkpoint.py, soma/machinetalk/hashes.py
+    acceptance_criteria:
+      - "Checkpoint: stage=planbeaver, status=DONE, plan_hash=<value>"
+      - "Hash printed as PLAN_HASH: <value>"
+      - "NO graph writes"
+      - "NO engine calls"
+      - "NO progress rendering"
+    hard_gates:
+      - no_llm_calls
+      - no_graph_writes
+      - no_progress_render
+      - checkpoint_status_is_DONE
+      - nonce_echo_required
+
+  - slice_id: s11-outrobeaver-build-payload
+    name: "S11 -- Outro Beaver: build payload from plan + extraction + raw chatset, write to disk (NO engine call, NO checkpoint)"
+    objective: |
+      Start in /home/flintx/soma-10-14.
+      Read plan from /tmp/soma_planbeaver_plan.json, extraction from /tmp/soma_introbeaver_*.json, raw chatset from /tmp/soma_distiller_chatset.json.
+      Build combined payload: session_id, plan, extraction entities, raw_chat_set.
+      Write to /tmp/soma_outrobeaver_payload.json.
+      STOP. Do nothing else.
+    scope: soma/machinetalk/fleet.py, soma/machinetalk/hashes.py
+    acceptance_criteria:
+      - "Payload written to /tmp/soma_outrobeaver_payload.json"
+      - "Contains session_id, plan, extraction, raw_chat_set"
+      - "Valid JSON"
+      - "NO engine call"
+      - "NO checkpoint"
+    hard_gates:
+      - no_engine_call
+      - no_checkpoint
+      - payload_is_valid_json
+      - nonce_echo_required
+
+  - slice_id: s12-outrobeaver-call-engine
+    name: "S12 -- Outro Beaver: call engine with tb-006-outrobeaver prompt + payload, parse journal, write to disk (NO graph store, NO checkpoint)"
+    objective: |
+      Start in /home/flintx/soma-10-14.
+      Read /tmp/soma_outrobeaver_payload.json.
+      Load tb-006-outrobeaver system prompt.
+      Call engine with system prompt + payload.
+      Parse response into journal events: list of dicts with event_type, timestamp, source, confidence.
+      Write to /tmp/soma_outrobeaver_journal.json.
+      On failure: write /tmp/soma_outrobeaver_error.txt.
+      STOP. Do nothing else.
+    scope: soma/machinetalk/engine.py, soma/machinetalk/fleet.py
+    acceptance_criteria:
+      - "Engine call with tb-006-outrobeaver prompt"
+      - "Response parsed into journal events"
+      - "Journal written to /tmp/soma_outrobeaver_journal.json"
+      - "On failure: error file written"
+      - "NO graph store"
+      - "NO checkpoint"
+    hard_gates:
+      - engine_call_logged
+      - response_persisted
+      - no_graph_store
+      - no_checkpoint
+      - nonce_echo_required
+
+  - slice_id: s13-outrobeaver-store-and-checkpoint
+    name: "S13 -- Outro Beaver: store journal nodes in Neo4j, compute journal_hash, write checkpoint DONE, print hash (NO engine, NO render)"
+    objective: |
+      Start in /home/flintx/soma-10-14.
+      Read journal from /tmp/soma_outrobeaver_journal.json.
+      Create Neo4j JournalNodes: session_id, event_type, timestamp, source, confidence.
+      Compute journal_hash = canonical_json of the journal.
+      Write checkpoint "outrobeaver" DONE with journal_hash.
+      Print: JOURNAL_HASH: <value>
+      STOP. Do nothing else.
+    scope: soma/nexus_dendrite.py, soma/store.py, soma/machinetalk/checkpoint.py, soma/machinetalk/hashes.py
+    acceptance_criteria:
+      - "JournalNodes created in Neo4j"
+      - "Nodes have correct props"
+      - "Checkpoint: stage=outrobeaver, status=DONE, journal_hash=<value>"
+      - "Hash printed as JOURNAL_HASH: <value>"
+      - "NO engine calls"
+      - "NO progress rendering"
+    hard_gates:
+      - no_llm_calls
+      - no_progress_render
+      - checkpoint_status_is_DONE
+      - nodes_exist_in_graph
+      - nonce_echo_required
+
+  - slice_id: s14-nexus-query-and-store
+    name: "S14 -- Nexus: query Neo4j for session directives + journals, create BlueprintNodes in graph, compute blueprint_hash, write checkpoint DONE, print hash (NO engine call, NO render)"
+    objective: |
+      Start in /home/flintx/soma-10-14.
+      Query Neo4j for all DirectiveNodes and JournalNodes by session_id.
+      Synthesize a raw blueprint: list of sections with type (system-context, component, data-flow) and content.
+      Create Neo4j BlueprintNodes for each section.
+      Compute blueprint_hash = canonical_json of the blueprint sections.
+      Write checkpoint "nexus" DONE with blueprint_hash.
+      Print: BLUEPRINT_HASH: <value>
+      STOP. Do nothing else.
+    scope: soma/nexus_dendrite.py, soma/store.py, soma/machinetalk/checkpoint.py, soma/machinetalk/hashes.py
+    acceptance_criteria:
+      - "BlueprintSections created as Neo4j nodes"
+      - "Nodes have session_id, section_type, content props"
+      - "Checkpoint: stage=nexus, status=DONE, blueprint_hash=<value>"
+      - "Hash printed as BLUEPRINT_HASH: <value>"
+      - "NO engine/LLM calls"
+      - "NO progress rendering"
+    hard_gates:
+      - no_llm_calls
+      - no_progress_render
+      - checkpoint_status_is_DONE
+      - blueprint_nodes_exist
+      - nonce_echo_required
