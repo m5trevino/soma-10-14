@@ -548,18 +548,22 @@ def _fmt_bytes(n) -> str:
 
 
 def unwrap_payload(parsed):
-    """Return the distiller's own output object from a stored payload.
+    """Return a stage's own output object from a stored payload.
 
-    The model returns ``{"_meta": {...}, "distiller_output": {...}}``. Every
-    field of interest (skip, skip_reason, signal_quality, directives, ...)
-    lives inside ``distiller_output``, so reading the envelope reports zeros.
-    Payloads that are already flat pass through unchanged.
+    The model returns ``{"_meta": {...}, "<stage>_output": {...}}``. Every
+    field of interest lives inside that wrapper, so reading the envelope
+    reports zeros. Payloads that are already flat pass through unchanged.
+
+    The wrapper key differs per stage, so every ``*_output`` key is checked
+    rather than only the distiller's.
     """
     if not isinstance(parsed, dict):
         return {}
-    inner = parsed.get("distiller_output")
-    if isinstance(inner, dict):
-        return inner
+    for key in ("distiller_output", "introbeaver_output",
+                "planbeaver_output", "outrobeaver_output"):
+        inner = parsed.get(key)
+        if isinstance(inner, dict):
+            return inner
     return parsed
 
 
@@ -613,3 +617,172 @@ def distiller_summary(soma_path, chars_in, parsed) -> str:
 
     parts.append(f"  {_C_BOLD}soma{_C_RESET}         {soma_path}")
     return "\n".join(parts)
+
+
+# ── Per-stage result detail ─────────────────────────────────────────────
+#
+# One block per stage as it completes, so the CLI shows what the stage
+# actually produced instead of only START/SKIP/FAIL lines. Every value
+# printed is a field from that stage's own output contract.
+
+def _pct(value) -> str:
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def introbeaver_detail(chars_in, parsed) -> str:
+    """TB-004: entry counts, signal quality, noise, artifacts, verdict."""
+    body = unwrap_payload(parsed)
+    by_type = body.get("entry_count_by_type") or {}
+    noise = body.get("noise_signature") or {}
+    entries = body.get("entries") or []
+    artifacts = body.get("artifacts") or []
+    chron = body.get("chronology_resolved") or []
+    discarded = body.get("discarded") or []
+
+    parts = [f"  {_C_BOLD}chars in{_C_RESET}    {chars_in:,}"]
+    parts.append(f"  {_C_BOLD}entries{_C_RESET}     {body.get('extracted_count', len(entries))}"
+                 f"  " + "  ".join(f"{k}={v}" for k, v in by_type.items() if v))
+    parts.append(f"  {_C_BOLD}signal{_C_RESET}      {_pct(body.get('signal_quality'))}"
+                 f"   {_C_DIM}user msgs {body.get('user_message_count', '—')}"
+                 f"  noise words {noise.get('noise_words', 0)}{_C_RESET}")
+
+    noise_bits = [f"{k} {v}" for k, v in noise.items()
+                  if k != "noise_words" and v]
+    if noise_bits:
+        parts.append(f"  {_C_BOLD}noise{_C_RESET}       {', '.join(noise_bits)}")
+
+    if artifacts:
+        kinds = {}
+        for a in artifacts:
+            kinds[a.get("artifact_type", "?")] = kinds.get(a.get("artifact_type", "?"), 0) + 1
+        parts.append(f"  {_C_BOLD}artifacts{_C_RESET}   {len(artifacts)}  ("
+                     + ", ".join(f"{k} {v}" for k, v in kinds.items()) + ")")
+
+    if chron:
+        superseded = sum(len(c.get("losers") or []) for c in chron)
+        parts.append(f"  {_C_BOLD}chronology{_C_RESET}  {len(chron)} intent group(s), "
+                     f"{superseded} superseded")
+
+    if discarded:
+        reasons = {}
+        for d in discarded:
+            r = d.get("reason", "?")
+            reasons[r] = reasons.get(r, 0) + 1
+        parts.append(f"  {_C_BOLD}discarded{_C_RESET}   {len(discarded)}  ("
+                     + ", ".join(f"{k} {v}" for k, v in reasons.items()) + ")")
+
+    status = body.get("status") or "—"
+    colour = _C_GREEN if status == "PASS" else _C_YELLOW
+    line = f"  {_C_BOLD}status{_C_RESET}      {colour}{status}{_C_RESET}"
+    if body.get("block_reason"):
+        line += f"   {_C_DIM}{body['block_reason']}{_C_RESET}"
+    if body.get("skip_reason"):
+        line += f"   {_C_DIM}{body['skip_reason']}{_C_RESET}"
+    parts.append(line)
+    return "\n".join(parts)
+
+
+def planbeaver_detail(chars_in, parsed) -> str:
+    """TB-005: files, functions, line budget, contracts, execution order."""
+    body = unwrap_payload(parsed)
+    files = body.get("files") or []
+    budget = body.get("budget") or {}
+    sequence = body.get("execution_sequence") or []
+    contracts = body.get("data_contracts") or []
+
+    functions = sum(len(f.get("functions") or []) for f in files)
+    lines = body.get("estimated_lines_total")
+    if lines is None:
+        lines = sum(int(f.get("estimated_lines") or 0) for f in files)
+
+    parts = [f"  {_C_BOLD}chars in{_C_RESET}    {chars_in:,}"]
+    parts.append(f"  {_C_BOLD}plan{_C_RESET}        {len(files)} file(s)   "
+                 f"{functions} function(s)   ~{lines:,} line(s)")
+    if budget:
+        parts.append(f"  {_C_BOLD}budget{_C_RESET}      "
+                     + "  ".join(f"{k}={v}" for k, v in budget.items()))
+    if contracts:
+        parts.append(f"  {_C_BOLD}contracts{_C_RESET}   {len(contracts)}")
+    if sequence:
+        head = " → ".join(str(s) for s in sequence[:6])
+        more = "" if len(sequence) <= 6 else f" → … (+{len(sequence) - 6})"
+        parts.append(f"  {_C_BOLD}sequence{_C_RESET}    {head}{more}")
+    if body.get("cycle"):
+        parts.append(f"  {_C_BOLD}cycle{_C_RESET}       {_C_YELLOW}{body['cycle']}{_C_RESET}")
+    parts.append(f"  {_C_BOLD}status{_C_RESET}      {body.get('status') or '—'}")
+    return "\n".join(parts)
+
+
+def outrobeaver_detail(chars_in, parsed) -> str:
+    """TB-006: journal size, clarity, drift, friction, session health."""
+    body = unwrap_payload(parsed)
+    journal = body.get("journal_entries") or []
+    analysis = body.get("clarity_and_communication_analysis") or {}
+    summary = body.get("summary") or {}
+    comp = body.get("health_components") or {}
+    drift = analysis.get("drift_events") or []
+    friction = analysis.get("friction_points") or []
+
+    parts = [f"  {_C_BOLD}chars in{_C_RESET}    {chars_in:,}"]
+    parts.append(f"  {_C_BOLD}journal{_C_RESET}     {len(journal)} entr(ies)")
+
+    clarity = analysis.get("session_clarity_score")
+    if clarity is not None:
+        parts.append(f"  {_C_BOLD}clarity{_C_RESET}     {_pct(clarity)}   "
+                     f"{_C_DIM}user reps {analysis.get('user_repetition_count', 0)}"
+                     f"  agent reps {analysis.get('agent_repetition_count', 0)}"
+                     f"  friction {_pct(analysis.get('friction_rate'))}{_C_RESET}")
+
+    if drift:
+        worst = max((d.get("severity", "MINOR") for d in drift),
+                    key=lambda s: ["MINOR", "MODERATE", "MAJOR", "CRITICAL"].index(s)
+                    if s in ["MINOR", "MODERATE", "MAJOR", "CRITICAL"] else 0)
+        parts.append(f"  {_C_BOLD}drift{_C_RESET}       {len(drift)} event(s)  worst {worst}")
+    if friction:
+        kinds = {}
+        for f in friction:
+            k = f.get("type", "?")
+            kinds[k] = kinds.get(k, 0) + 1
+        parts.append(f"  {_C_BOLD}friction{_C_RESET}    "
+                     + ", ".join(f"{k} {v}" for k, v in kinds.items()))
+
+    if comp:
+        parts.append(f"  {_C_BOLD}health{_C_RESET}      score {_pct(comp.get('score'))}   "
+                     f"{_C_DIM}clarity {_pct(comp.get('clarity'))}"
+                     f"  drift −{_pct(comp.get('drift_penalty'))}"
+                     f"  friction −{_pct(comp.get('friction_penalty'))}{_C_RESET}")
+
+    if summary:
+        health = summary.get("session_health", "—")
+        colour = (_C_GREEN if health == "GREEN"
+                  else _C_YELLOW if health == "YELLOW" else _C_RED
+                  if "_C_RED" in globals() else _C_YELLOW)
+        parts.append(f"  {_C_BOLD}session{_C_RESET}     {colour}{health}{_C_RESET}")
+        if summary.get("built"):
+            parts.append(f"  {_C_BOLD}built{_C_RESET}       {str(summary['built'])[:70]}")
+        if summary.get("blocked"):
+            parts.append(f"  {_C_BOLD}blocked{_C_RESET}     {str(summary['blocked'])[:70]}")
+
+    parts.append(f"  {_C_BOLD}status{_C_RESET}      {body.get('status') or '—'}")
+    return "\n".join(parts)
+
+
+STAGE_DETAIL = {
+    "introbeaver": introbeaver_detail,
+    "planbeaver": planbeaver_detail,
+    "outrobeaver": outrobeaver_detail,
+}
+
+
+def stage_detail(stage: str, chars_in, parsed) -> str:
+    """Render the detail block for a stage, or an empty string."""
+    fn = STAGE_DETAIL.get(stage)
+    if fn is None or not isinstance(parsed, dict):
+        return ""
+    try:
+        return fn(chars_in, parsed)
+    except Exception:
+        return ""

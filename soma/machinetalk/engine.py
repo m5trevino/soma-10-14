@@ -519,6 +519,10 @@ class Engine:
             if stage == "distiller":
                 self._print(progress.distiller_summary(
                     self._soma.path, cs.chars, gate.parsed))
+            else:
+                detail = progress.stage_detail(stage, cs.chars, gate.parsed)
+                if detail:
+                    self._print(detail)
             return True
         if is_hard_block(gate):
             self.ck.cs_mark(sid, n, stage, BLOCKED,
@@ -569,7 +573,10 @@ class Engine:
 
         # Each beaver reads the raw ChatSet directly. No cross-dependencies.
         _all_stages = ("distiller", "introbeaver", "planbeaver", "outrobeaver")
-        _run_stages = (getattr(self, "_stage", None) or "distiller")
+        # ``--stage`` narrows the run to one stage. Without it, all four run.
+        # The old default was "distiller" alone, which silently skipped every
+        # downstream beaver while the tables reported them as NOT RUN.
+        _run_stages = (getattr(self, "_stage", None) or _all_stages)
         _run_stages = (_run_stages,) if isinstance(_run_stages, str) else _run_stages
 
         if self.granular:
