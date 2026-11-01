@@ -249,17 +249,30 @@ def run_pipeline(paths: list[str], full_objects: list[dict] | None = None,
 
     # Show metadata summary if we have full export objects
     if full_objects:
+        def _labels(value) -> list[str]:
+            """Export metadata is either a string, a list, or a list of
+            {name, confidence} objects depending on the extractor version."""
+            if not value:
+                return []
+            if isinstance(value, str):
+                return [value]
+            if isinstance(value, dict):
+                label = value.get("name") or value.get("label") or ""
+                return [str(label)] if label else []
+            if isinstance(value, (list, tuple)):
+                out: list[str] = []
+                for item in value:
+                    out.extend(_labels(item))
+                return out
+            return [str(value)]
+
         domains = set()
         sentiments = set()
         for obj in full_objects:
             md = obj.get("metadata", {})
             if isinstance(md, dict):
-                d = md.get("domain", "")
-                if d:
-                    domains.add(d)
-                s = md.get("sentiment", "")
-                if s:
-                    sentiments.add(s)
+                domains.update(_labels(md.get("domain")))
+                sentiments.update(_labels(md.get("sentiment")))
         if domains:
             print(f"  Domains:   {', '.join(sorted(domains))}")
         if sentiments:
