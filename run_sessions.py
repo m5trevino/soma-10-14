@@ -227,6 +227,9 @@ def run_pipeline(paths: list[str], full_objects: list[dict] | None = None,
     workers : int | None
         Number of parallel workers. Defaults to 2 if not specified.
     """
+    # Step mode pauses after every build stage. It is opt-in: running from a
+    # terminal no longer forces it, because an unattended run that stops on a
+    # prompt stalls with no one there to press Enter.
     ensure_debug_dir()
 
     if profile is None:
@@ -929,9 +932,20 @@ def run_launcher(granular: bool = False, force: bool = False) -> None:
         try: input()
         except EOFError: pass
     pick = _prompt_session(paths)
-    only = [pick] if pick else None
-    max_chatsets = None if only else _prompt_max_chatsets()
-    selected_stage = "distiller" if only else None
+    only = None
+    max_chatsets = None
+    selected_stage = None
+    if pick:
+        sid, first = pick
+        total = next((t for s, f, t, _ in _load_session_entries(paths) if s == sid), 0)
+        count = _prompt_chatset_count(total)
+        if count == 1:
+            only = [(sid, first)]
+            selected_stage = "distiller"
+        elif count is not None:
+            only = [(sid, first + i) for i in range(count)]
+    else:
+        max_chatsets = _prompt_max_chatsets()
 
     # Save state
     _save_state(state)
@@ -988,8 +1002,13 @@ def run_launcher(granular: bool = False, force: bool = False) -> None:
     if only:
         sid, n = only[0]
         print(f"  Session:  {sid}")
-        print(f"  Chatset:  first (set {n})")
-        print(f"  Stage:    distiller")
+        if len(only) == 1:
+            print(f"  Chatset:  set {n}")
+            print(f"  Stage:    {selected_stage or 'all'}")
+        else:
+            print(f"  Chatsets: {len(only)} starting at set {n}")
+    else:
+        print("  Chatsets: all")
     print()
 
     answer = input("  Launch? [Y/n]: ").strip().lower()
@@ -1342,6 +1361,25 @@ def _prompt_session(paths: list[str]) -> tuple[str, int] | None:
             continue
         sid, first, _, _ = entries[n - 1]
         return sid, first
+
+
+def _prompt_chatset_count(total: int) -> int | None:
+    """How many chatsets from the selected session. None means all."""
+    if total:
+        print(f"\n  This session has {total} chatsets.")
+    while True:
+        raw = input("  How many to process? [1] / [a]ll / number: ").strip().lower()
+        if not raw:
+            return 1
+        if raw in ("a", "all"):
+            return None
+        try:
+            n = int(raw)
+            if n >= 1:
+                return min(n, total) if total else n
+        except ValueError:
+            pass
+        print("  Enter a number or 'a'.")
 
 
 def _prompt_max_chatsets() -> int | None:

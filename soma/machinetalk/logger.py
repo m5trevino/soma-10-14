@@ -33,6 +33,8 @@ def _label(status: str) -> str:
         "SKIP":  "[≋ SKIP] ",
         "REDO":  "[↺ REDO] ",
         "INFO":  "[ℹ INFO] ",
+        "SUM":   "[Σ TOTAL]",
+        "NOTE":  "[· NOTE] ",
     }
     return labels.get(status, f"[{status:7}]")
 
@@ -131,6 +133,24 @@ class StageLogger:
         if not self.quiet:
             print(line)
         _write_to(self._master_log, line)
+
+    def summary(self, *, session: str, done: int, failed: int,
+                skipped: int, total: int) -> None:
+        """Final per-session tally, written to console and the master log.
+
+        Stage 1 is otherwise only visible as individual START/DONE lines, so
+        the run total is recorded here rather than left implicit.
+        """
+        self._emit(session, "SUM",
+                   f"session={session} | done={done} failed={failed} "
+                   f"skipped={skipped} total={total}")
+
+    def note(self, stage: str, *, session: str, detail: str = "") -> None:
+        """Free-form operator note (tables, paths, non-stage output)."""
+        msg = f"session={session}"
+        if detail:
+            msg += f" | {detail}"
+        self._emit(stage, "NOTE", msg)
 
     # -- internal ----------------------------------------------------------
 

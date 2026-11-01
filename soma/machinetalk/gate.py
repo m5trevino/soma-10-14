@@ -48,10 +48,17 @@ class GateResult:
     skip_reason: str = ""
     exfil_type: str = ""
     signal_quality: str = ""
+    provenance: str = ""           # provenance check summary, when run
 
     @property
     def reasons(self) -> str:
         return "; ".join(self.errors)
+
+    def first_reason(self) -> str:
+        """The first error, not the first character of the joined string."""
+        if self.errors:
+            return self.errors[0]
+        return "UNKNOWN"
 
 
 # ---------------------------------------------------------------------------
@@ -144,11 +151,16 @@ def _find_all(obj: Any, key: str) -> list[Any]:
 # JSON path
 # ---------------------------------------------------------------------------
 
+def _strip_fences(text: str) -> str:
+    """Remove markdown code fences so LLM-wrapped JSON parses cleanly."""
+    text = re.sub(r"^```[a-zA-Z]*\s*\n?", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\n?\s*```\s*$", "", text, flags=re.MULTILINE)
+    return text
+
+
 def _extract_json_object(text: str) -> tuple[dict | None, list[str]]:
-    s = text.strip()
+    s = _strip_fences(text.strip())
     errs: list[str] = []
-    if _FENCE_RE.search(s):
-        errs.append("markdown_fence_present")
     start = s.find("{")
     end = s.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -240,10 +252,8 @@ _SCOUT_TAIL = re.compile(r"SCOUT REVIEW COMPLETE\. VERDICT:\s*(\w+)\s*$")
 
 
 def _check_scout(raw: str) -> GateResult:
-    s = raw.strip()
+    s = _strip_fences(raw.strip())
     errs: list[str] = []
-    if _FENCE_RE.search(s):
-        errs.append("markdown_fence_present")
     if not s.startswith(_SCOUT_HEAD):
         errs.append(f"missing_head:{s[:40]!r}")
     m = None

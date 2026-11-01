@@ -47,17 +47,18 @@ _STEP_LABELS = {
 _STAGE_ORDER = ["distiller", "introbeaver", "planbeaver", "outrobeaver"]
 
 _COL_HEADERS = [
-    "",
-    "CHARACTERS IN",
-    "CHARACTERS OUT",
-    "SIGNALS-INTRO-BEAVER",
-    "TASKS-PLAN-BEAVER",
-    "OUTCOME-OUTRO-BEAVER",
-    "MODEL-USED",
+    "STAGE",
+    "CHARS IN",
+    "CHARS OUT",
+    "STATUS",
+    "SIGNALS",
+    "TASKS",
+    "OUTCOME",
+    "MODEL",
 ]
 
 # Fixed column widths matching the user's spec exactly
-_COL_WIDTHS = [15, 15, 16, 20, 19, 20, 40]
+_COL_WIDTHS = [15, 12, 12, 22, 10, 10, 10, 34]
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
@@ -174,13 +175,105 @@ def session_header(session_id: str, total_sets: int) -> str:
 
 # ── Chatset Table ───────────────────────────────────────────────────────
 
+def _chars_out(sd: dict) -> str:
+    """Characters the stage produced.
+
+    The store keeps the verbatim response for the distiller, so its output
+    size is measurable. Beavers only keep a token count, and tokens are not
+    characters, so the cell stays blank rather than showing a number that
+    means something else.
+    """
+    raw = sd.get("raw_response")
+    if isinstance(raw, str) and raw:
+        return _fmt_number(len(raw))
+    out = sd.get("chars_out")
+    if isinstance(out, (int, float)) and out:
+        return _fmt_number(int(out))
+    return ""
+
+
+def _status_cell(sd: dict | None) -> str:
+    """One unambiguous status word, including why a stage did not run."""
+    if sd is None:
+        return "NOT RUN"
+    status = (sd.get("status") or "PENDING").upper()
+    if status == "SKIPPED":
+        reason = (sd.get("skip_reason") or "").strip()
+        return f"SKIP {reason}" if reason else "SKIP"
+    if status in ("FAILED", "BLOCKED"):
+        errs = sd.get("errors")
+        if isinstance(errs, str) and errs.strip():
+            return f"{status} {errs.strip()[:14]}"
+        return status
+    if status == "DONE":
+        verdict = str(sd.get("verdict") or "").strip()
+        if verdict.lower() in ("true", "1", "yes"):
+            # The stage ran and decided there was nothing to keep.
+            return "DONE (NO SIGNAL)"
+        return "DONE"
+    return status
+
+
+def _stage_counts(sd: dict | None) -> tuple[str, str, str]:
+    """Signal / task / outcome counts from the stored payload, if present."""
+    if not sd:
+        return "", "", ""
+    parsed = sd.get("payload")
+    if not isinstance(parsed, dict):
+        raw = sd.get("raw_response")
+        if isinstance(raw, str) and raw.strip().startswith("{"):
+            try:
+                import json as _json
+                parsed = _json.loads(raw)
+            except Exception:
+                parsed = None
+    if not isinstance(parsed, dict):
+        return "", "", ""
+
+    body = unwrap_payload(parsed)
+
+    def _n(*keys: str) -> str:
+        total = 0
+        found = False
+        for key in keys:
+            val = body.get(key)
+            if isinstance(val, list):
+                total += len(val)
+                found = True
+        return str(total) if found else ""
+
+    return (_n("directives", "preferences", "questions", "confirmations"),
+            _n("tasks", "plan_items", "files"),
+            _n("outcomes", "deliverables", "lessons"))
+
+
+def _find_key(obj, key: str):
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            r = _find_key(v, key)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_key(v, key)
+            if r is not None:
+                return r
+    return None
+
+
 def chatset_table(set_num: int, total: int, stages: dict,
                   gateway_map: dict | None = None) -> str:
     """Render the full table for one completed chatset.
 
-    ``stages``: dict keyed by stage name, values are checkpoint dicts:
-      status, verdict, model, tokens, artifact, errors, etc.
-    ``gateway_map``: optional model_id → gateway lookup map for _clean_model.
+    Every cell is either a measured character count or an explicit status.
+    Tokens are deliberately absent: they vary by provider and do not describe
+    how much text moved through the stage.
+
+    ``stages``: dict keyed by stage name, values are checkpoint dicts
+    (status, verdict, model, chars_in, raw_response, errors, ...).
+    ``gateway_map``: optional model_id -> gateway lookup for _clean_model.
     """
     rows: list[list[str]] = []
 
@@ -188,50 +281,23 @@ def chatset_table(set_num: int, total: int, stages: dict,
         sd = stages.get(sname)
         label = _STAGE_LABELS.get(sname, sname.upper())
 
-        if sd is None:
-            rows.append([label, "SKIPPED", "", "", "", "", ""])
-            continue
+        chars_in = ""
+        if sd:
+            ci = sd.get("chars_in")
+            if isinstance(ci, (int, float)) and ci > 0:
+                chars_in = _fmt_number(int(ci))
 
-        status = sd.get("status", "PENDING")
-        model = sd.get("model") or ""
-        verdict = sd.get("verdict") or ""
-        chars_in = sd.get("chars_in")
-        tokens = sd.get("tokens")
-
-        if sname == "distiller":
-            if status == "SKIPPED":
-                col = [label, "SKIPPED", "", "", "", "", _clean_model(model, gateway_map)]
-            else:
-                col = [label, "", "", "", "", "", _clean_model(model, gateway_map)]
-                if chars_in is not None and chars_in > 0:
-                    col[1] = _fmt_number(chars_in)
-        elif sname == "introbeaver":
-            if status == "SKIPPED":
-                col = [label, "", "", "SKIPPED", "", "", _clean_model(model, gateway_map)]
-            elif status in ("FAILED", "BLOCKED"):
-                col = [label, "", "", "FAILED", "", "", _clean_model(model, gateway_map)]
-            else:
-                col = [label, "", _fmt_number(tokens) if tokens else "",
-                       verdict if verdict else "", "", "", _clean_model(model, gateway_map)]
-        elif sname == "planbeaver":
-            if status == "SKIPPED":
-                col = [label, "", "", "", "SKIPPED", "", _clean_model(model, gateway_map)]
-            elif status in ("FAILED", "BLOCKED"):
-                col = [label, "", "", "", "FAILED", "", _clean_model(model, gateway_map)]
-            else:
-                col = [label, "", _fmt_number(tokens) if tokens else "",
-                       "", verdict if verdict else "", "", _clean_model(model, gateway_map)]
-        else:
-            # outrobeaver
-            if status == "SKIPPED":
-                col = [label, "", "", "", "", "SKIPPED", _clean_model(model, gateway_map)]
-            elif status in ("FAILED", "BLOCKED"):
-                col = [label, "", "", "", "", "FAILED", _clean_model(model, gateway_map)]
-            else:
-                col = [label, "", _fmt_number(tokens) if tokens else "",
-                       "", "", verdict if verdict else "PARTIAL", _clean_model(model, gateway_map)]
-
-        rows.append(col)
+        signals, tasks, outcome = _stage_counts(sd)
+        rows.append([
+            label,
+            chars_in,
+            _chars_out(sd) if sd else "",
+            _status_cell(sd),
+            signals,
+            tasks,
+            outcome,
+            _clean_model((sd or {}).get("model") or "", gateway_map),
+        ])
 
     # Build lines using fixed column widths
     lines: list[str] = []
@@ -256,11 +322,26 @@ def chatset_table(set_num: int, total: int, stages: dict,
 # ── Summary ─────────────────────────────────────────────────────────────
 
 def session_summary(done: int, failed: int, skipped: int, total: int) -> str:
-    """Final summary block."""
-    top = "╔══════════•⊱✦⊰•══════════╗"
-    bot = "╚══════════•⊱✦⊰•══════════╝"
-    line = f"   DONE: {done}  FAILED: {failed}  SKIPPED: {skipped}  TOTAL: {total}"
-    return f"\n{top}\n{line}\n{bot}\n"
+    """Final per-session tally.
+
+    ``done`` counts chatsets the distiller processed, ``skipped`` counts
+    chatsets it judged signal-free, ``failed`` counts chatsets that errored.
+    The three add up to ``total``.
+    """
+    accounted = done + failed + skipped
+    lines = [
+        "",
+        "  ┌─ SESSION COMPLETE " + "─" * 34,
+        f"  │  chatsets        {total}",
+        f"  │  distilled       {done}",
+        f"  │  skipped         {skipped}   (distiller found no signal)",
+        f"  │  failed          {failed}",
+        f"  │  accounted       {accounted}/{total}"
+        + ("" if accounted == total else "   ← MISMATCH"),
+        "  └" + "─" * 52,
+        "",
+    ]
+    return "\n".join(lines)
 
 
 # ── Live stage line ─────────────────────────────────────────────────────
@@ -430,9 +511,16 @@ class DistillerProgress:
 
         self._steps_done.set()
 
-        # Steps are exhausted but the model may still be running.
+        # Steps are exhausted but the model may still be running. Report once
+        # at each 30 s mark, then every 60 s, so a long retry storm does not
+        # bury the log in identical lines.
+        last_reported = 0
         while not self._stop.wait(5.0):
             elapsed = time.monotonic() - self._started
+            step = 30 if elapsed < 120 else 60
+            if elapsed - last_reported < step:
+                continue
+            last_reported = elapsed
             with _io_lock:
                 print(
                     f"  {_C_DIM}… awaiting model response ({elapsed:.0f}s){_C_RESET}",
@@ -459,39 +547,69 @@ def _fmt_bytes(n) -> str:
     return f"{n}B"
 
 
-def distiller_summary(soma_path, parsed) -> str:
-    """Render the SOMA DB path plus a few distiller processing stats."""
-    parsed = parsed or {}
+def unwrap_payload(parsed):
+    """Return the distiller's own output object from a stored payload.
 
-    def _count(key: str) -> int:
-        v = parsed.get(key)
-        if isinstance(v, (list, tuple)):
-            return len(v)
-        return int(v) if isinstance(v, int) else 0
+    The model returns ``{"_meta": {...}, "distiller_output": {...}}``. Every
+    field of interest (skip, skip_reason, signal_quality, directives, ...)
+    lives inside ``distiller_output``, so reading the envelope reports zeros.
+    Payloads that are already flat pass through unchanged.
+    """
+    if not isinstance(parsed, dict):
+        return {}
+    inner = parsed.get("distiller_output")
+    if isinstance(inner, dict):
+        return inner
+    return parsed
 
-    sigq = parsed.get("signal_quality")
-    ns = parsed.get("noise_signature") or {}
-    noise_b = ns.get("total_bytes_noise", 0)
-    signal_b = ns.get("total_bytes_signal", 0)
-    intent = str(parsed.get("intent") or "").strip()
-    verdict = "SKIP" if parsed.get("skip") else "PASS"
 
-    parts = [f"  {_C_BOLD}SOMA DB{_C_RESET}  {soma_path}"]
-    if intent:
-        parts.append(f"  {_C_BOLD}intent{_C_RESET}   {intent[:100]}")
+def _count_of(payload: dict, key: str) -> int:
+    v = payload.get(key)
+    if isinstance(v, (list, tuple)):
+        return len(v)
+    return int(v) if isinstance(v, int) else 0
+
+
+def distiller_summary(soma_path, chars_in, parsed) -> str:
+    """One block stating what the distiller actually decided.
+
+    Every number here is either a character count taken from the source or a
+    value read out of the model's own output object. Nothing is estimated.
+    """
+    payload = unwrap_payload(parsed)
+
+    skip = bool(payload.get("skip"))
+    skip_reason = str(payload.get("skip_reason") or "").strip()
+    intent = str(payload.get("intent_anchor") or payload.get("intent") or "").strip()
+    sigq = payload.get("signal_quality")
+
+    counts = {k: _count_of(payload, k) for k in (
+        "directives", "constraints", "preferences", "questions",
+        "corrections", "confirmations", "artifacts")}
+
+    if skip:
+        decision = f"{_C_YELLOW}SKIPPED{_C_RESET}"
+        if skip_reason:
+            decision += f" {_C_DIM}({skip_reason}){_C_RESET}"
+    else:
+        decision = f"{_C_GREEN}PROCESSED{_C_RESET}"
+
+    parts = [
+        f"  {_C_BOLD}decision{_C_RESET}      {decision}",
+    ]
+    if isinstance(chars_in, int) and chars_in >= 0:
+        parts.append(f"  {_C_BOLD}chars in{_C_RESET}     {chars_in:,}")
     if isinstance(sigq, (int, float)):
-        parts.append(
-            f"  {_C_BOLD}signal quality{_C_RESET}  {sigq:.2f}   "
-            f"{_C_DIM}noise {_fmt_bytes(noise_b)} / signal {_fmt_bytes(signal_b)}{_C_RESET}"
-        )
-    skip_reason = str(parsed.get("skip_reason") or "").strip()
-    if skip_reason:
-        parts.append(f"  {_C_BOLD}skip reason{_C_RESET}  {skip_reason}")
-    parts.append(
-        f"  {_C_BOLD}directives{_C_RESET} {_count('directives')}   "
-        f"{_C_BOLD}constraints{_C_RESET} {_count('constraints')}   "
-        f"{_C_BOLD}preferences{_C_RESET} {_count('preferences')}   "
-        f"{_C_BOLD}questions{_C_RESET} {_count('questions')}   "
-        f"{_C_BOLD}verdict{_C_RESET} {_C_GREEN if verdict == 'PASS' else _C_YELLOW}{verdict}{_C_RESET}"
-    )
+        parts.append(f"  {_C_BOLD}signal qual{_C_RESET}  {sigq:.2f}")
+    if intent:
+        parts.append(f"  {_C_BOLD}intent{_C_RESET}       {intent[:96]}")
+
+    found = "  ".join(f"{k}={v}" for k, v in counts.items() if v)
+    if found:
+        parts.append(f"  {_C_BOLD}extracted{_C_RESET}    {found}")
+    else:
+        parts.append(f"  {_C_BOLD}extracted{_C_RESET}    {_C_DIM}nothing "
+                     f"(all signal lists empty){_C_RESET}")
+
+    parts.append(f"  {_C_BOLD}soma{_C_RESET}         {soma_path}")
     return "\n".join(parts)

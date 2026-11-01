@@ -7,6 +7,7 @@ TurnKey SDK does rotation, retry, gateway, and the HTTP call.
 from __future__ import annotations
 
 import http.client
+import inspect
 import sys
 import time
 from dataclasses import dataclass, field
@@ -83,6 +84,18 @@ class TurnKeyClient:
     def __init__(self, profile_path: str) -> None:
         self._profile_path = profile_path
         self._sdk = self._load_sdk(profile_path)
+        self._pea_kw = self._supports_pea_session(self._sdk.run_stage)
+
+    @staticmethod
+    def _supports_pea_session(fn) -> bool:
+        """True when the installed SDK accepts pea_session."""
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return True
+        if "pea_session" in params:
+            return True
+        return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
     @staticmethod
     def _load_sdk(profile_path: str):
@@ -99,7 +112,8 @@ class TurnKeyClient:
              pea_session: str | None = None) -> StageResult:
         mapped = _STAGE_MAP.get(stage, stage)
         start = time.monotonic()
-        raw = self._sdk.run_stage(mapped, messages, pea_session=pea_session)
+        kwargs = {"pea_session": pea_session} if self._pea_kw else {}
+        raw = self._sdk.run_stage(mapped, messages, **kwargs)
         elapsed = (time.monotonic() - start) * 1000
 
         choices = raw.get("choices", []) if isinstance(raw, dict) else []
@@ -136,6 +150,13 @@ class EngineClient:
     def model_for(self, stage: str) -> str:
         return "turnkey"
 
+    # A DNS failure cannot be fixed by waiting: the host does not resolve at
+    # all, so every retry fails the same way. Give it one quick second chance
+    # and then surface it instead of burning the whole retry budget.
+    _UNRECOVERABLE = ("Name or service not known",
+                      "nodename nor servname",
+                      "Temporary failure in name resolution")
+
     def _call_with_retry(self, stage: str, messages: list[dict[str, str]],
                          attempts: int = 10,
                          pea_session: str | None = None) -> Any:
@@ -146,22 +167,47 @@ class EngineClient:
         and is not a URLError, so it propagates out of ``run_stage`` and kills
         the chatset. Retrying here also advances the SDK's deck rotator, so a
         bad model is skipped instead of being hit again.
+
+        Failures that cannot improve with time (DNS resolution) abort after the
+        first retry, because retrying them only multiplies the wait by the
+        attempt count.
         """
         last: Exception | None = None
+        dns_failures = 0
         for attempt in range(attempts):
             try:
                 return self._tk.call(stage, messages, pea_session=pea_session)
+            except TypeError:
+                # A signature mismatch is a code bug, not a transport failure.
+                # Retrying it ten times only burns the deck.
+                raise
             except (ConnectionError, TimeoutError, http.client.HTTPException) as exc:
                 last = exc
+                text = f"{type(exc).__name__}: {exc}"
                 print(f"\n[retry] {stage} attempt {attempt + 1}/{attempts} "
-                      f"failed: {type(exc).__name__}: {exc}",
-                      file=sys.stderr, flush=True)
+                      f"failed: {text}", file=sys.stderr, flush=True)
+                if any(tok in text for tok in self._UNRECOVERABLE):
+                    dns_failures += 1
+                    if dns_failures >= 2:
+                        print(f"[retry] {stage}: DNS failure will not recover, "
+                              f"stopping after {attempt + 1} attempt(s)",
+                              file=sys.stderr, flush=True)
+                        raise
+                if attempt + 1 < attempts:
+                    time.sleep(1.5 * (attempt + 1))
             except Exception as exc:
                 # SDKError and anything else — also retry to rotate the deck
                 last = exc
+                text = f"{type(exc).__name__}: {exc}"
                 print(f"\n[retry] {stage} attempt {attempt + 1}/{attempts} "
-                      f"failed: {type(exc).__name__}: {exc}",
-                      file=sys.stderr, flush=True)
+                      f"failed: {text}", file=sys.stderr, flush=True)
+                if any(tok in text for tok in self._UNRECOVERABLE):
+                    dns_failures += 1
+                    if dns_failures >= 2:
+                        print(f"[retry] {stage}: DNS failure will not recover, "
+                              f"stopping after {attempt + 1} attempt(s)",
+                              file=sys.stderr, flush=True)
+                        raise
                 if attempt + 1 < attempts:
                     time.sleep(1.5 * (attempt + 1))
         assert last is not None
@@ -171,17 +217,36 @@ class EngineClient:
                    chunk: str = "", contracts: str = "",
                    payload: dict | None = None,
                    expected_hash: str | None = None,
-                   temperature: float | None = None) -> Any:
-        from .fleet import assemble, load_system_prompt
-        from .gate import validate, is_done, is_hard_block
+                   temperature: float | None = None,
+                   soma: Any = None,
+                   raw_chat_set: list[dict] | None = None) -> Any:
+        """Call one stage and verify its output before it is trusted.
 
-        # Derive pea_session from session_id: use the session_id as-is.
-        # The engine appends <WW>-<D><L>- to create a unique dir per day/week.
-        # If the same session_id is reused across days, new dirs are created
-        # automatically — no collision possible.
+        Instructions come from the ``stage_instructions`` row for this stage,
+        never from the markdown files on disk. A stage is told its own job and
+        nothing about the other stages, so it has no pipeline to reason about.
+
+        When ``raw_chat_set`` is supplied (distiller and introbeaver), every
+        emitted entry must match the source text at the offsets it claims.
+        A provenance failure fails the stage: the model's claim is not
+        allowed into the graph unverified.
+        """
+        from .fleet import assemble
+        from .gate import validate, is_done, is_hard_block
+        from .provenance import (verify_distiller, verify_introbeaver)
+
         pea_session = session_id
 
-        sys_prompt = load_system_prompt(stage, strip_injection=True)
+        instruction = None
+        if soma is not None:
+            instruction = soma.get_stage_instruction(stage)
+        if instruction is None:
+            raise RuntimeError(
+                f"stage {stage!r} has no row in stage_instructions. "
+                f"Instructions are read from the database, not from disk; "
+                f"build the store from soma_template.sql first.")
+
+        sys_prompt = instruction["body"]
         _, user_msg = assemble(stage, sys_prompt, chunk=chunk,
                                contracts=contracts, payload=payload)
         messages = [
@@ -190,6 +255,19 @@ class EngineClient:
         ]
         result = self._call_with_retry(stage, messages, pea_session=pea_session)
         gate = validate(stage, result.content, expected_hash=expected_hash)
+
+        # ── provenance: the claim must exist in the source ──────────────
+        if raw_chat_set is not None and gate.parsed and is_done(gate):
+            if stage == "distiller":
+                prov = verify_distiller(gate.parsed, raw_chat_set)
+            elif stage == "introbeaver":
+                prov = verify_introbeaver(gate.parsed, raw_chat_set)
+            else:
+                prov = None
+            if prov is not None and not prov.ok:
+                gate.errors.extend(str(i) for i in prov.issues)
+                gate.ok = False
+                gate.provenance = prov.summary()
 
         rec = CallRecord(
             stage=stage,

@@ -10,6 +10,8 @@ skeu-style-docs/
 newmachine/
 *.md
 !README.md
+!AGENTS.md
+!GROUND_TRUTH.md
 !soma/machine-talk/*.md
 !soma/machine-talk-OLD/*.md
 !soma/docs/*.md

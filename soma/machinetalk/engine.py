@@ -369,6 +369,7 @@ class Engine:
                     stage, session_id=sid, chatset_id=cs.chatset_id,
                     chunk=chunk, contracts=contracts, payload=payload,
                     expected_hash=cs.chatset_hash,
+                    soma=self._soma, raw_chat_set=cs.raw_chat_set,
                 )
             finally:
                 prog.finish()
@@ -380,6 +381,7 @@ class Engine:
                 chunk=chunk, contracts=contracts, payload=payload,
                 expected_hash=cs.chatset_hash if stage in
                 ("distiller", "introbeaver") else None,
+                soma=self._soma, raw_chat_set=cs.raw_chat_set,
                 live_stage=stage,
             )
         else:
@@ -457,10 +459,17 @@ class Engine:
                 # stage spinner owns the live line (progress.emit defers it).
                 self._print(f"WARNING: debug event write failed: {e}")
         if is_done(gate):
+            _parsed = gate.parsed if isinstance(gate.parsed, dict) else {}
+            _dout = _parsed.get("distiller_output") if isinstance(
+                _parsed.get("distiller_output"), dict) else _parsed
             self.ck.cs_mark(sid, n, stage, DONE,
                             verdict=gate.verdict or None,
                             model=rec.model, tokens=rec.total_tokens,
                             chars_in=cs.chars,
+                            skip_reason=(_dout or {}).get("skip_reason")
+                            if stage == "distiller" else None,
+                            signal_quality=(_dout or {}).get("signal_quality")
+                            if stage == "distiller" else None,
                             latency_ms=round(rec.latency_ms, 1),
                             artifact=str(p.relative_to(self.out)),
                             raw_response=rec.raw_response,
@@ -473,18 +482,18 @@ class Engine:
                 self.ck.cs_downstream_skipped(sid, n, "distiller")
             if gate.skipped:
                 self.log.skip(stage, session=sid, chatset=n,
-                              detail=f"tokens={rec.total_tokens} ms={latency:.0f} model={rec.model}")
-                self._print(f"  -[{stage.upper()}]- [SKIPPED]")
-                self._print(f"  model={rec.model or 'N/A'} chars_in={cs.chars} kept={rec.completion_tokens} dropped={rec.prompt_tokens}")
-                elapsed_s = latency / 1000
-                self._print(f"  Done in {elapsed_s:.0f}s")
+                              detail=f"chars_in={cs.chars} ms={latency:.0f} model={rec.model}")
+                self._print(f"  -[{stage.upper()}]- [SKIPPED] chars_in={cs.chars:,} "
+                            f"out={len(rec.raw_response or ''):,} "
+                            f"{latency / 1000:.1f}s  model={rec.model or 'N/A'}")
             else:
+                verdict_label = ("" if gate.verdict.lower() in ("false", "", "0", "no")
+                                 else f" verdict={gate.verdict}")
                 self.log.done(stage, session=sid, chatset=n,
-                               detail=f"tokens={rec.total_tokens} ms={latency:.0f} model={rec.model} verdict={gate.verdict}")
-                self._print(f"  -[{stage.upper()}]- [SUCCESS]")
-                self._print(f"  model={rec.model or 'N/A'} chars_in={cs.chars} kept={rec.completion_tokens} dropped={rec.prompt_tokens}")
-                elapsed_s = latency / 1000
-                self._print(f"  Done in {elapsed_s:.0f}s")
+                               detail=f"chars_in={cs.chars} ms={latency:.0f} model={rec.model}{verdict_label}")
+                self._print(f"  -[{stage.upper()}]- [DONE] chars_in={cs.chars:,} "
+                            f"out={len(rec.raw_response or ''):,} "
+                            f"{latency / 1000:.1f}s  model={rec.model or 'N/A'}")
             if gate.parsed is not None:
                 self._save_artifact(cs.chatset_id, stage, gate.parsed)
             # ---- Soma graph writes (NEW: legacy pipeline compatibility) ----
@@ -496,13 +505,20 @@ class Engine:
                         sid, cs.chatset_id, n, gate, rec.model, latency)
                     self._log_summary(stage, sid, dcounts, chatset=n)
                 elif stage in ("introbeaver", "planbeaver", "outrobeaver"):
-                    counts = self._bridge.write_intro_plan_outrobeaver(
-                        sid, cs.chatset_id, stage, gate, rec.model, latency)
-                    self._log_summary(stage, sid, counts, chatset=n)
+                    try:
+                        counts = self._bridge.write_intro_plan_outrobeaver(
+                            sid, cs.chatset_id, stage, gate, rec.model, latency)
+                        self._log_summary(stage, sid, counts, chatset=n)
+                    except Exception as exc:
+                        # A graph write failure must not be reported as a
+                        # successful stage. Surface it and fail the chatset.
+                        self._print(f"  [{stage.upper()}] GRAPH WRITE FAILED: "
+                                    f"{type(exc).__name__}: {exc}")
+                        raise
                 self._soma._persist()
             if stage == "distiller":
                 self._print(progress.distiller_summary(
-                    self._soma.path, gate.parsed))
+                    self._soma.path, cs.chars, gate.parsed))
             return True
         if is_hard_block(gate):
             self.ck.cs_mark(sid, n, stage, BLOCKED,
@@ -510,20 +526,19 @@ class Engine:
                             artifact=str(p.relative_to(self.out)))
             self.log.block(stage, session=sid, chatset=n,
                            detail=f"verdict={gate.verdict} models={len(rec.attempts)}")
-            self._print(f"  -[{stage.upper()}]- [BLOCKED]")
-            self._print(f"  model={rec.model or 'N/A'} chars_in={cs.chars} reason={gate.verdict or 'BLOCKED'}")
-            elapsed_s = latency / 1000
-            self._print(f"  Done in {elapsed_s:.0f}s")
+            self._print(f"  -[{stage.upper()}]- [BLOCKED] verdict={gate.verdict or 'BLOCKED'} "
+                        f"chars_in={cs.chars:,} {latency / 1000:.1f}s  "
+                        f"model={rec.model or 'N/A'}")
         else:
+            reason = gate.first_reason()
             self.ck.cs_mark(sid, n, stage, FAILED, model=rec.model,
                             errors=gate.reasons[:300],
                             artifact=str(p.relative_to(self.out)))
             self.log.fail(stage, session=sid, chatset=n,
                           detail=f"models={len(rec.attempts)} errors={gate.reasons[:80]}")
-            self._print(f"  -[{stage.upper()}]- [FAILED]")
-            self._print(f"  model={rec.model or 'N/A'} chars_in={cs.chars} reason={gate.reasons[0] if gate.reasons else 'UNKNOWN'}")
-            elapsed_s = latency / 1000
-            self._print(f"  Done in {elapsed_s:.0f}s")
+            self._print(f"  -[{stage.upper()}]- [FAILED] {reason} "
+                        f"chars_in={cs.chars:,} {latency / 1000:.1f}s  "
+                        f"model={rec.model or 'N/A'}")
         return False
 
     def run_chatset(self, cs: ChatSet, worker: int = 0) -> dict:
@@ -607,8 +622,9 @@ class Engine:
                 self.ck.cs_mark(sid, n, stage, FAILED,
                                 model=None, chars_in=cs.chars, errors=detail)
                 self.log.fail(stage, session=sid, chatset=n, detail=detail)
-                self._print(f"  -[{stage.upper()}]- [FAILED]")
-                self._print(f"  model=N/A chars_in={cs.chars} reason={detail}")
+                self._print(f"  -[{stage.upper()}]- [FAILED:TRANSPORT] "
+                            f"{type(exc).__name__} chars_in={cs.chars:,}  "
+                            f"{detail[:120]}")
                 result[stage] = FAILED
                 ok = False
             else:
@@ -714,24 +730,36 @@ class Engine:
             for f in as_completed(futs):
                 cs = futs[f]
                 completed += 1
-                self._print(f"Chatset {cs.source_chunk_id or cs.set_number} finished. Total characters: {cs.chars:,}")
+                self._print(f"Chatset {completed}/{len(jobs)} "
+                            f"({cs.source_chunk_id or cs.set_number}) finished. "
+                            f"Total characters: {cs.chars:,}")
                 try:
                     r = f.result()
                 except Exception as e:
                     ok = False
                     self._print(f"  ✗ chatset {cs.chatset_id} crashed: {e}")
                     continue
-                # Count chatset by actual outcome: DONE only when all stages pass
+                # Count the chatset by the stages that actually ran. A bounded
+                # run (``--stage distiller``) leaves the other stages out of the
+                # result entirely, which must not count as a failure.
+                ran = [s for s in ("distiller", "introbeaver", "planbeaver",
+                                   "outrobeaver") if s in r]
                 r_d = r.get("distiller", "")
-                if r_d == SKIPPED:
+                distiller_skipped = (
+                    self.ck.cs_stage(cs.session_id, cs.set_number,
+                                     "distiller").get("skip_reason") is not None
+                    or self.ck.cs_stage(cs.session_id, cs.set_number,
+                                        "distiller").get("verdict") in ("true", True))
+                if r_d == SKIPPED or distiller_skipped:
                     counts["skipped"] += 1
-                elif any(r.get(s) in (FAILED, BLOCKED) for s in (
-                        "distiller", "introbeaver", "planbeaver", "outrobeaver")):
+                elif any(r.get(s) in (FAILED, BLOCKED) for s in ran):
                     counts["failed"] += 1
                     ok = False
-                elif all(r.get(s) == DONE for s in (
-                        "distiller", "introbeaver", "planbeaver", "outrobeaver")):
+                elif ran and all(r.get(s) == DONE for s in ran):
                     counts["done"] += 1
+                else:
+                    counts["failed"] += 1
+                    ok = False
 
                 # ── Debug event writing ─────────────────────────
                 if self._debug_dir:
@@ -745,6 +773,10 @@ class Engine:
                                 ck_data[sn] = sd
                         # Build debug event
                         ev = {
+                            "stage": "chatset",
+                            "status": ("done" if all(v.get("status") == DONE
+                                                     for v in ck_data.values())
+                                       and ck_data else "running"),
                             "session_id": sid,
                             "chatset_number": n,
                             "chatset_id": cs.chatset_id,
@@ -772,6 +804,11 @@ class Engine:
         # Print overall summary
         self._print(progress.session_summary(
             counts["done"], counts["failed"], counts["skipped"], len(jobs)))
+        # The console summary above never reaches the master log (that file is
+        # written by StageLogger, not stdout), so record the same tally there.
+        self.log.summary(session=session_id, done=counts["done"],
+                         failed=counts["failed"],
+                         skipped=counts["skipped"], total=len(jobs))
         return ok
 
     # -- stages 2-4: one build unit (session or merged project) --------------
@@ -837,11 +874,13 @@ class Engine:
             if gate.parsed is not None:
                 self._save_artifact(build, stage, gate.parsed)
             self.log.done(stage, session=build,
-                          detail=f"tokens={rec.total_tokens} ms={latency:.0f} model={rec.model} verdict={gate.verdict}")
+                          detail=f"chars_out={len(rec.raw_response or '')} ms={latency:.0f} "
+                                 f"model={rec.model} verdict={gate.verdict}")
             # ---- Soma graph writes (NEW: legacy pipeline compatibility) ----
-            # Stats line: model, chars_in, kept, dropped
-            chars_in = self.ck.load(build).get("chatsets", {}).get("1", {}).get("chars", 0)
-            self._print(f"  model={rec.model or 'N/A'} chars_in={chars_in} kept={rec.completion_tokens} dropped={rec.prompt_tokens}")
+            _in = len(chunk or "") or len(canonical_json(payload or {}))
+            self._print(f"  -[{stage.upper()}]- [DONE] chars_in={_in:,} "
+                        f"out={len(rec.raw_response or ''):,} "
+                        f"{latency / 1000:.1f}s  model={rec.model or 'N/A'}")
             with self._soma_lock:
                 if stage == "nexus":
                     counts = self._bridge.write_nexus(build, gate, rec.model, latency)
@@ -872,14 +911,17 @@ class Engine:
                             artifact=str(p.relative_to(self.out)))
             self.log.block(stage, session=build,
                            detail=f"verdict={gate.verdict} models={len(rec.attempts)}")
-            self._print(f"  model={rec.model or 'N/A'} chars_in=0 kept={rec.completion_tokens} dropped={rec.prompt_tokens}")
+            self._print(f"  -[{stage.upper()}]- [BLOCKED] verdict={gate.verdict or 'BLOCKED'} "
+                        f"{latency / 1000:.1f}s  model={rec.model or 'N/A'}")
         else:
             self.ck.ss_mark(build, stage, FAILED, model=rec.model,
                             errors=gate.reasons[:300],
                             artifact=str(p.relative_to(self.out)))
             self.log.fail(stage, session=build,
                           detail=f"models={len(rec.attempts)} errors={gate.reasons[:80]}")
-            self._print(f"  model={rec.model or 'N/A'} chars_in=0 kept={rec.completion_tokens} dropped={rec.prompt_tokens}")
+            self._print(f"  -[{stage.upper()}]- [FAILED] "
+                        f"{gate.reasons[0] if gate.reasons else 'UNKNOWN'} "
+                        f"{latency / 1000:.1f}s  model={rec.model or 'N/A'}")
         return False
 
     def _merged_plan(self, sessions: list[Session]) -> dict | None:
@@ -913,6 +955,55 @@ class Engine:
                                    if f.get("file_id")],
         }
         return merged
+
+    def _scout_contracts(self, files: list[dict], code: str) -> str:
+        """Build the ``dna_contracts`` block scout expects.
+
+        Contracts come from the collapsed truth corpus, ranked by BM25 against
+        the artifact's own text, so they describe what this code claims to do
+        rather than a fixed list of four generic rules.
+
+        Falls back to the local registry only when the corpus is unavailable,
+        and always emits the ``[{contract_id, statement, family, origin}]``
+        shape TB-012 declares.
+        """
+        from .invariants import LawCorpus
+
+        wanted = int(getattr(self, "scout_contracts", 60) or 60)
+        corpus = LawCorpus(getattr(self, "law_db",
+                                  "/media/storage/invariants/invariants.db"))
+        contracts: list[dict] = []
+        used_corpus = corpus.available
+
+        if used_corpus:
+            for law in corpus.search(code, limit=wanted):
+                stmt = law.get("statement") or ""
+                if not stmt:
+                    continue
+                contracts.append({
+                    "contract_id": f"DNA-{len(contracts) + 1:03d}",
+                    "statement": stmt,
+                    "family": law.get("family") or "GENERAL",
+                    "origin": (f"{law.get('repo')}:{law.get('scope')}"
+                               if law.get("repo") else "truth_corpus"),
+                    "composite": law.get("composite"),
+                })
+            corpus.close()
+
+        if not contracts:
+            from .invariants import InvariantRegistry
+            exts = [Path(f.get("path", "")).suffix for f in files if f.get("path")]
+            for i, r in enumerate(InvariantRegistry().query(exts), 1):
+                contracts.append({
+                    "contract_id": f"DNA-{i:03d}",
+                    "statement": r.get("statement", ""),
+                    "family": str(r.get("family", "GENERAL")).upper(),
+                    "origin": f"local:{r.get('rule_id', '')}",
+                })
+
+        self._print(f"  scout contracts: {len(contracts)} "
+                    f"({'truth corpus' if used_corpus else 'local fallback'})")
+        return canonical_json(contracts)
 
     def run_stages_2_4(self, build: str, sessions: list[Session],
                        from_stage: str | None = None,
@@ -1010,13 +1101,10 @@ class Engine:
                     return False
                 code = "\n\n".join(
                     f"### {f.get('path')}\n{f.get('content', '')}" for f in files)
-                # Scout queries the invariant registry. Eagle does not supply rules.
-                from .invariants import InvariantRegistry
-                exts = [Path(f.get("path", "")).suffix for f in files if f.get("path")]
-                rules = InvariantRegistry().query(exts)
-                contracts_txt = "\n".join(
-                    f"{r['rule_id']}: {r['statement']} (severity {r['severity']})"
-                    for r in rules) or "NONE"
+                # Scout tests the artifact against dna_contracts drawn from the
+                # collapsed truth corpus. The TB-012 contract wants an array of
+                # {contract_id, statement, family, origin}, not a joined string.
+                contracts_txt = self._scout_contracts(files, code)
                 self._run_build_stage(build, "scout", chunk=code,
                                       contracts=contracts_txt)
                 # parse scout text report into a JSON artifact for OC
@@ -1122,6 +1210,16 @@ class Engine:
 # Top-level run
 # ---------------------------------------------------------------------------
 
+def _pause(prompt: str = "\n  Press Enter to continue...") -> None:
+    """Wait for Enter, but only when a human is attached."""
+    if not sys.stdin.isatty():
+        return
+    try:
+        input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 def run(sessions: list[Session], *, out_dir: Path,
         client: MachineTask if False else MachineTalkClient,
         workers: int = 4, from_stage: str | None = None,
@@ -1177,11 +1275,13 @@ def run(sessions: list[Session], *, out_dir: Path,
     if only or (max_chatsets is not None and max_chatsets > 0):
         # A bounded stage-1 run is a chunk batch. Stages 2-4 are project-wide
         # and must not run after one chunk.
+        if not quiet:
+            print("\n  [Bounded run: one chatset. Stages 2-4 need the full stage-1 run.]")
+            _pause()
         return 0
 
     if step_mode:
-        print("\n  [Press Enter to continue to stages 2-4...]")
-        input()
+        _pause("\n  [Press Enter to continue to stages 2-4...]")
 
     if stage and stage != "distiller":
         return 0

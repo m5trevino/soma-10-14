@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import time
 from typing import Any
@@ -120,10 +121,10 @@ class MyelinatorOptimizer:
         for i, slot in enumerate(slots, start=1):
             name = slot.properties.get("name", "unknown")
             print(f"    [myelinator] [{i}/{len(slots)}] Hardening {name}()...", flush=True)
-            result = self.harden_slot(slot.id, session_id)
+            result = self.harden_slot(slot.node_id, session_id)
             opt_id = result["optimized_slot_id"]
             optimized_slot_ids.append(opt_id)
-            slot_invariant_map[slot.id] = result["laws"]
+            slot_invariant_map[slot.node_id] = result["laws"]
             pin_map[opt_id] = result["pin"]
 
         # TB-OLC-004: Write master manifest node
@@ -168,11 +169,11 @@ class MyelinatorOptimizer:
         slot_lines = []
         for s in slots:
             code = s.properties.get("code_block", "")[:200]
-            slot_lines.append(f"  {s.id}: {s.properties.get('mandate', '')} | code={code[:80]}...")
+            slot_lines.append(f"  {s.node_id}: {s.properties.get('mandate', '')} | code={code[:80]}...")
 
         inv_lines = []
         for inv in invariants:
-            inv_lines.append(f"  {inv.id}: {inv.properties.get('invariant_text', '')[:150]}")
+            inv_lines.append(f"  {inv.node_id}: {inv.properties.get('invariant_text', '')[:150]}")
 
         prompt = (
             "You are the Myelinator OLC — a SOMA graph optimizer.\n\n"
@@ -223,25 +224,24 @@ class MyelinatorOptimizer:
             if e.rel_type == "GOVERNS" and e.target == slot_id
         }
 
-        inv_by_id = {inv.id: inv for inv in invariants}
-        # Preserve GOVERNS edges already in the tree (e.g. from LLM matching).
+        inv_by_id = {inv.node_id: inv for inv in invariants}
+        # GOVERNS edges already in the tree come from retrieval (BM25 over the
+        # law corpus) and are ranked. Trust them: they are the only signal that
+        # distinguishes two functions in the same file.
         matched: list[Any] = [inv_by_id[sid] for sid in existing_governs if sid in inv_by_id]
 
-        # Deterministic text overlap for any invariants not already linked.
-        slot_needles = {
-            (slot.properties.get("name", "") or "").lower(),
-            (slot.properties.get("mandate", "") or "").lower(),
-            (slot.properties.get("file_path", "") or "").lower(),
-        }
-        slot_needles.discard("")
-
-        for inv in invariants:
-            if inv.id in existing_governs:
-                continue
-            inv_text = str(inv.properties.get("invariant_text", "")).lower()
-            if any(needle in inv_text for needle in slot_needles):
-                self._soma.create_edge(inv.id, "GOVERNS", slot_id)
-                matched.append(inv)
+        # Fallback only when retrieval produced nothing for this slot.
+        # Matching is on the slot's own name — never the file path, which made
+        # every function in a file inherit that file's laws regardless of what
+        # the function does.
+        if not matched:
+            name = (slot.properties.get("name", "") or "").lower()
+            tokens = {t for t in re.split(r"[^a-z0-9]+", name) if len(t) > 3}
+            for inv in invariants:
+                inv_text = str(inv.properties.get("invariant_text", "")).lower()
+                if any(tok in inv_text for tok in tokens):
+                    self._soma.create_edge(inv.node_id, "GOVERNS", slot_id)
+                    matched.append(inv)
 
         opt_id = f"opt-{slot_id}"
         existing = self._soma.get_node(opt_id)
