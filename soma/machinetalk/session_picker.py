@@ -34,14 +34,17 @@ from typing import Optional
 # ── Session root paths ────────────────────────────────────────────────────
 
 SESSIONS_PATH = Path("/media/storage/dendritic123/chat-logs/sessions")
-SEARCHMONKEY_DB = Path("/media/storage/dendritic123/searchmonkey-iii/backend/vault.db")
+# The populated SearchMonkey vault. The older path under
+# searchmonkey-iii/backend/ is a 0-byte file and silently yields nothing.
+SEARCHMONKEY_DB = Path("/media/storage/graphdb/session_site/vault.db")
 
 
 class SessionInfo:
     """Metadata about a single session."""
     __slots__ = [
         "id", "path", "title", "provider", "chat_sets", "characters",
-        "anchors", "domain", "sub_domain", "dev_score", "total_sets"
+        "anchors", "domain", "sub_domain", "dev_score", "total_sets",
+        "code_blocks", "functions", "duplicate_of"
     ]
 
     def __init__(self, session_id: str, path: Path):
@@ -55,7 +58,10 @@ class SessionInfo:
         self.domain = None
         self.sub_domain = None
         self.dev_score = 0
+        self.code_blocks = 0
+        self.functions = 0
         self.total_sets = 0
+        self.duplicate_of = None
         self._load_metadata()
 
     def _load_metadata(self):
@@ -132,12 +138,43 @@ def _load_searchmonkey_db():
         conn = sqlite3.connect(str(SEARCHMONKEY_DB))
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        cur.execute("SELECT session_id, domain, sub_domain FROM sessions")
-        for row in cur.fetchall():
-            meta[row["session_id"]] = {
-                "domain": row.get("domain"),
-                "sub_domain": row.get("sub_domain"),
-            }
+        # dev_sessions carries the score; sessions carries the taxonomy.
+        # Prefer dev_sessions and fall back to sessions so a vault with only
+        # one of the two still contributes what it has.
+        try:
+            cur.execute(
+                "SELECT session_id, total_score, code_blocks, inline_code, "
+                "code_extensions, imports, functions, dev_keywords, "
+                "config_files, heredoc_code_files, combined_text_length, "
+                "chat_set_count, domain, sub_domain FROM dev_sessions")
+            for row in cur.fetchall():
+                meta[row["session_id"]] = {
+                    "domain": row["domain"],
+                    "sub_domain": row["sub_domain"],
+                    "dev_score": int(row["total_score"] or 0),
+                    "code_blocks": int(row["code_blocks"] or 0),
+                    "functions": int(row["functions"] or 0),
+                    "imports": int(row["imports"] or 0),
+                    "dev_keywords": int(row["dev_keywords"] or 0),
+                    "config_files": int(row["config_files"] or 0),
+                    "combined_text_length": int(row["combined_text_length"] or 0),
+                }
+        except sqlite3.Error:
+            cur.execute("SELECT session_id, domain, sub_domain FROM sessions")
+            for row in cur.fetchall():
+                meta[row["session_id"]] = {
+                    "domain": row["domain"],
+                    "sub_domain": row["sub_domain"],
+                }
+        # sessions fills in taxonomy for ids dev_sessions did not cover.
+        try:
+            cur.execute("SELECT session_id, domain, sub_domain FROM sessions")
+            for row in cur.fetchall():
+                entry = meta.setdefault(row["session_id"], {})
+                entry.setdefault("domain", row["domain"])
+                entry.setdefault("sub_domain", row["sub_domain"])
+        except sqlite3.Error:
+            pass
         conn.close()
     except Exception:
         pass
@@ -159,11 +196,32 @@ def scan_sessions() -> list:
                 session = SessionInfo(session_dir.name, session_dir)
                 # Overlay SearchMonkey metadata
                 if session.id in sm_meta:
-                    session.domain = sm_meta[session.id].get("domain")
-                    session.sub_domain = sm_meta[session.id].get("sub_domain")
+                    entry = sm_meta[session.id]
+                    session.domain = entry.get("domain")
+                    session.sub_domain = entry.get("sub_domain")
+                    session.dev_score = int(entry.get("dev_score") or 0)
+                    session.code_blocks = int(entry.get("code_blocks") or 0)
+                    session.functions = int(entry.get("functions") or 0)
                 sessions.append(session)
             except Exception:
                 continue
+
+    # Collapse duplicate exports. The same conversation is often present
+    # under several names ("copy.of", "branch.of", date-prefixed), and at
+    # 1,600+ groups the top of the dev list is otherwise the same session
+    # repeated. A session that another one supersedes is tagged, not removed:
+    # the picker can still select it, but it is not ranked twice.
+    by_content: dict[tuple, list] = {}
+    for session in sessions:
+        if session.characters and session.chat_sets:
+            by_content.setdefault((session.characters, session.chat_sets), []).append(session)
+    for group in by_content.values():
+        if len(group) < 2:
+            continue
+        canonical = min(group, key=lambda s: (len(s.id), s.id))
+        for dup in group:
+            if dup is not canonical:
+                dup.duplicate_of = canonical.id
     return sessions
 
 
@@ -184,7 +242,13 @@ def sort_key_chars(item, reverse=True):
 def sort_key_anchor(item, reverse=False):
     return (item.domain or "", item.sub_domain or "", item.display_name())
 
+def sort_key_dev(item, reverse=True):
+    """Rank by SearchMonkey dev score, with duplicate exports demoted."""
+    return (0 if item.duplicate_of else 1,
+            item.dev_score, item.code_blocks, item.display_name())
+
 SORT_FUNCTIONS = {
+    "dev": sort_key_dev,
     "name": sort_key_name,
     "provider": sort_key_provider,
     "sets": sort_key_sets,
@@ -193,6 +257,7 @@ SORT_FUNCTIONS = {
 }
 
 SORT_NAMES = {
+    "dev": "Dev Score",
     "name": "Name",
     "provider": "Provider",
     "sets": "Chat Sets",
@@ -212,11 +277,11 @@ def _short_name(name: str, max_len: int = 50) -> str:
     return name
 
 
-def run_session_picker(sort_by: str = "name") -> list[str] | None:
+def run_session_picker(sort_by: str = "dev") -> list[str] | None:
     """Main curses UI for session selection.
 
     Args:
-        sort_by: Initial sort key (name, provider, sets, chars, anchor)
+        sort_by: Initial sort key (dev, name, provider, sets, chars, anchor)
 
     Returns:
         list of selected session paths, or None if user cancels.
@@ -256,7 +321,7 @@ def run_session_picker(sort_by: str = "name") -> list[str] | None:
                            f"Filter: {'ON' if search_filter else 'OFF'}".ljust(W - 1)[:W-1])
 
         # Key hints
-        hints = "↑↓Nav  SpaceSel  EnterDone  RRev  N/P/S/C/A ChangeSort  /Search  ESC Quit"
+        hints = "↑↓Nav  SpaceSel  EnterDone  RRev  D/N/P/S/C/A Sort  /Search  ESC Quit"
         stdscr.addstr(2, 0, hints.ljust(W - 1)[:W-1])
 
         if search_filter:
@@ -282,7 +347,10 @@ def run_session_picker(sort_by: str = "name") -> list[str] | None:
             s = sessions[idx]
             marker = "[+]" if idx in selected else "[ ]"
             name = _short_name(s.title or s.id)
-            meta = f" {s.chat_sets}s  {s.characters:>10,}c  {s.provider}"
+            score = f"{s.dev_score:>9,}" if s.dev_score else "        –"
+            dup = "  dup" if s.duplicate_of else ""
+            meta = (f" {score}  {s.chat_sets:>3}s  {s.characters:>9,}c"
+                    f"  {s.provider}{dup}")
             if s.domain:
                 meta += f"  ▸ {s.domain}"
             line = f"  {marker} {name}{meta}"
@@ -400,6 +468,14 @@ def run_session_picker(sort_by: str = "name") -> list[str] | None:
                 scroll_off = 0
                 hover_idx = 0
 
+            elif key == ord('d') or key == ord('D'):
+                current_sort = "dev"
+                sort_reversed = True
+                sort_sessions()
+                selected = set()
+                scroll_off = 0
+                hover_idx = 0
+
             elif key == ord('n') or key == ord('N'):
                 current_sort = "name"
                 sort_reversed = False
@@ -469,7 +545,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="SOMA Session Picker")
     parser.add_argument("--sort", default="name",
-                        choices=["name", "provider", "sets", "chars", "anchor"],
+                        choices=["dev", "name", "provider", "sets", "chars", "anchor"],
                         help="Initial sort mode")
     parser.add_argument("--queue", default="data/queue.json",
                         help="Output queue file path")
