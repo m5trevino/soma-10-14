@@ -24,6 +24,7 @@ _C_DIM = "\033[2m"
 _C_CYAN = "\033[36m"
 _C_GREEN = "\033[32m"
 _C_YELLOW = "\033[33m"
+_C_RED = "\033[31m"
 
 _DIVIDER = ("■□■□■□■□■□■□■□■■□■□■□■□■□■□■□■■□■□■□■□■□■□■□"
             "■■□■□■□■□■□■□■□■■□■□■□■□■□■□■□■■□■□■□■□■□■□■□"
@@ -45,6 +46,20 @@ _STEP_LABELS = {
 }
 
 _STAGE_ORDER = ["distiller", "introbeaver", "planbeaver", "outrobeaver"]
+
+_DISTILLER_STEPS = [
+    "hashing input",
+    "extracting heredocs, metadata, constraints",
+    "stripping noise: greetings, apologies, fillers, fences",
+    "checking for duplicate hashes",
+    "last user statement = current goal",
+    "classifying signals into graph data",
+    "matching intent across turns",
+    "logging noise purges + stats",
+    "computing overall signal quality",
+    "verdict: pass | skip | quarantine",
+    "writing canonical payload",
+]
 
 _COL_HEADERS = [
     "STAGE",
@@ -263,8 +278,9 @@ def _find_key(obj, key: str):
     return None
 
 
-def chatset_table(set_num: int, total: int, stages: dict,
-                  gateway_map: dict | None = None) -> str:
+def chatset_table(set_num, total: int, stages: dict,
+                  gateway_map: dict | None = None,
+                  position: int | None = None) -> str:
     """Render the full table for one completed chatset.
 
     Every cell is either a measured character count or an explicit status.
@@ -302,7 +318,13 @@ def chatset_table(set_num: int, total: int, stages: dict,
     # Build lines using fixed column widths
     lines: list[str] = []
 
+    # Three different numbers were in play: the set number inside the
+    # session (49306), how many chatsets that session has (44), and how many
+    # of them this run is doing (34). Reporting one as the other is what made
+    # the progress line contradict the header.
     marker_text = f"CHAT SET {set_num}/{total}"
+    if position is not None and position != set_num:
+        marker_text += f"  ({position} of {total} this run)"
     marker_side = "█" * 7
     lines.append(f"\n{marker_side}   {marker_text}   {marker_side}")
     lines.append("")
@@ -450,12 +472,26 @@ def spin(label: str, fn, *args, **kwargs):
         line.close()
 
 
-# ── Distiller step display ──────────────────────────────────────────────
+# ── Stage timing ────────────────────────────────────────────────────────
 #
-# The distiller's 11 processing steps (tb-001) all happen inside one LLM
-# call, so there is no natural per-step signal to print. This shows each
-# step on a ~30 s cadence (randomized durations) so the operator can see
-# what the call is doing, then heartbeats until the call returns.
+# The distiller keeps its ~30 s step display: it is the one call long enough
+# that a blank wait looks like a hang.
+#
+# Every later stage is one line. Before, a stage printed three unrelated
+# pieces under two different formats:
+#
+#   ✓ introbeaver trevino.war.room CS49306 turnkey... 13s      <- spinner, "✓" even on failure
+#   -[INTROBEAVER]- [FAILED] missing:introbeaver_output ...     <- result
+#   chars in   3,296 / plan   0 file(s) ...                      <- detail block
+#
+# The spinner froze on ✓ regardless of outcome, so a failed stage looked
+# successful, and the model was printed as the literal word "turnkey"
+# because EngineClient.model_for() returns a placeholder. Anything long
+# enough to be worth watching gets its own live line with a real model.
+
+_STAGE_START: dict[str, float] = {}
+_STAGE_TIMES: dict[str, list[tuple[float, str, str]]] = {}
+_STAGE_ORDER = ["distiller", "introbeaver", "planbeaver", "outrobeaver"]
 
 _DISTILLER_STEPS = [
     "hashing input",
@@ -472,67 +508,221 @@ _DISTILLER_STEPS = [
 ]
 
 
-class DistillerProgress:
-    """Dressed-up step-by-step display for one distiller call."""
+def _timestamp() -> str:
+    return time.strftime("%H:%M:%S")
 
-    def __init__(self, target: float = 30.0) -> None:
-        self._target = max(1.0, float(target))
+
+def stage_clock_start(stage: str) -> None:
+    """Record when a stage's model call began."""
+    _STAGE_START[stage] = time.monotonic()
+
+
+def stage_clock_done(stage: str, status: str) -> float:
+    """Record when a stage finished; return elapsed seconds."""
+    started = _STAGE_START.pop(stage, None)
+    elapsed = time.monotonic() - started if started is not None else 0.0
+    _STAGE_TIMES.setdefault(stage, []).append((elapsed, status, _timestamp()))
+    return elapsed
+
+
+def stage_clock_reset() -> None:
+    _STAGE_START.clear()
+    _STAGE_TIMES.clear()
+
+
+def _stage_label(stage: str) -> str:
+    return _STAGE_LABELS.get(stage, stage.upper())
+
+
+def _verdict_glyph(status: str) -> tuple[str, str]:
+    """Glyph and colour for a finished stage. Never ✓ for a failure."""
+    head = status.upper()
+    if head.startswith(("DONE", "PASS")):
+        return "✓", _C_GREEN
+    if head.startswith(("SKIP", "BLOCK")):
+        return "⊘", _C_YELLOW
+    return "✗", _C_RED
+
+
+class StageTimer:
+    """One live line per stage, ending in that stage's real outcome.
+
+    For the distiller this drives the step display as well, so the operator
+    sees the run progress inside the one call that lasts minutes. Every other
+    stage gets a spinner that names the stage and the model actually serving
+    it, then a single frozen line carrying the true result.
+    """
+
+    def __init__(self, stage: str, session: str, chatset, chars: int,
+                 model: str = "") -> None:
+        self.stage = stage
+        self.label = _stage_label(stage)
+        self.session = session
+        self.chatset = chatset
+        self.chars = chars
+        self.model = model or ""
         self._stop = threading.Event()
-        self._steps_done = threading.Event()
         self._thread: "threading.Thread | None" = None
         self._started = 0.0
+        self._is_distiller = stage == "distiller"
 
     def start(self) -> None:
         self._started = time.monotonic()
+        stage_clock_start(self.stage)
+
+        if self._is_distiller:
+            with _io_lock:
+                print(
+                    f"  {_C_DIM}{_timestamp()}{_C_RESET} "
+                    f"{_C_CYAN}▶ {self.label}{_C_RESET} "
+                    f"{_C_DIM}{self.session} CS{self.chatset} "
+                    f"{self.chars:,} chars{_C_RESET}",
+                    flush=True,
+                )
+            self._thread = threading.Thread(
+                target=self._distiller_steps, daemon=True,
+                name="distiller-steps")
+            self._thread.start()
+            return
+
+        # Later stages are short enough that a single live line is the whole
+        # story: stage, model, elapsed.
         self._thread = threading.Thread(
-            target=self._run, daemon=True, name="distiller-steps")
+            target=self._spin, daemon=True, name=f"spin-{self.stage}")
         self._thread.start()
 
-    def _run(self) -> None:
-        import random
+    def _spin(self) -> None:
+        """Redraw one line in place once per second.
 
+        Only when stdout is a terminal. Piped or captured output cannot
+        interpret a carriage return, so every frame became a new line and a
+        two-minute call emitted hundreds of near-identical rows.
+        """
+        frames = _SPINNER_FRAMES
+        interactive = sys.stdout.isatty()
+        idx = 0
+        width = 0
+        model = f" {self.model}" if self.model else ""
+        while not self._stop.wait(_SPINNER_TICK):
+            glyph = frames[idx % len(frames)]
+            idx += 1
+            if not interactive:
+                # No terminal: say it once, then stay quiet until it ends.
+                if idx == 1:
+                    with _io_lock:
+                        print(f"  … {self.label} CS{self.chatset}{model}",
+                              flush=True)
+                continue
+            elapsed = time.monotonic() - self._started
+            body = (f"  {glyph} {self.label} CS{self.chatset}{model} "
+                    f"{elapsed:.0f}s")
+            pad = " " * max(0, width - len(body))
+            width = max(width, len(body))
+            with _io_lock:
+                sys.stdout.write("\r" + body + pad)
+                sys.stdout.flush()
+
+    def _distiller_steps(self) -> None:
+        """The 11-step fill for the one call that runs for minutes.
+
+        These steps describe what the distiller's prompt asks the model to
+        do; they are not independently observable from here, so they pace
+        evenly rather than claiming measured durations.
+        """
         n = len(_DISTILLER_STEPS)
-        weights = [random.uniform(0.45, 1.55) for _ in range(n)]
-        scale = self._target / sum(weights)
         width = max(len(s) for s in _DISTILLER_STEPS) + 2
+        per = max(1.5, 30.0 / n)
 
-        for i, (step, w) in enumerate(zip(_DISTILLER_STEPS, weights), start=1):
-            dur = w * scale
-            if self._stop.wait(dur):
+        for i, step in enumerate(_DISTILLER_STEPS, start=1):
+            if self._stop.wait(per):
                 return
             dots = "." * max(3, width - len(step))
-            with _io_lock:
-                print(
-                    f"  {_C_GREEN}✓{_C_RESET} "
-                    f"{_C_DIM}[{i:02d}/{n}]{_C_RESET} "
-                    f"{_C_CYAN}{step}{_C_RESET} {_C_DIM}{dots} {dur:>4.1f}s{_C_RESET}",
-                    flush=True,
-                )
-
-        self._steps_done.set()
-
-        # Steps are exhausted but the model may still be running. Report once
-        # at each 30 s mark, then every 60 s, so a long retry storm does not
-        # bury the log in identical lines.
-        last_reported = 0
-        while not self._stop.wait(5.0):
             elapsed = time.monotonic() - self._started
-            step = 30 if elapsed < 120 else 60
-            if elapsed - last_reported < step:
-                continue
-            last_reported = elapsed
             with _io_lock:
                 print(
-                    f"  {_C_DIM}… awaiting model response ({elapsed:.0f}s){_C_RESET}",
+                    f"  {_C_DIM}{_timestamp()}{_C_RESET} "
+                    f"{_C_DIM}[{i:02d}/{n}]{_C_RESET} "
+                    f"{_C_CYAN}{step}{_C_RESET} "
+                    f"{_C_DIM}{dots} {elapsed:>4.0f}s{_C_RESET}",
                     flush=True,
                 )
 
-    def finish(self) -> None:
-        """Let the dressed-up output run through all steps, then stop."""
-        self._steps_done.wait()
+        # Steps are done but the model has not answered. Say so, once per
+        # minute, instead of repeating the last step.
+        last = 0.0
+        while not self._stop.wait(1.0):
+            elapsed = time.monotonic() - self._started
+            if elapsed - last < 60:
+                continue
+            last = elapsed
+            with _io_lock:
+                print(
+                    f"  {_C_DIM}{_timestamp()}   … {self.label} still "
+                    f"waiting on the model ({elapsed:.0f}s){_C_RESET}",
+                    flush=True,
+                )
+
+    def finish(self, status: str, detail: str = "") -> float:
+        """Stop the live line and print the stage's real result."""
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=6.0)
+            self._thread.join(timeout=3.0)
+
+        if not self._is_distiller and sys.stdout.isatty():
+            with _io_lock:
+                sys.stdout.write("\r" + " " * 100 + "\r")
+                sys.stdout.flush()
+
+        elapsed = stage_clock_done(self.stage, status)
+        glyph, colour = _verdict_glyph(status)
+        tail = f"  {_C_DIM}{detail}{_C_RESET}" if detail else ""
+        with _io_lock:
+            print(
+                f"  {_C_DIM}{_timestamp()}{_C_RESET} "
+                f"{colour}{glyph} {self.label}{_C_RESET} "
+                f"{elapsed:>6.1f}s  {colour}{status}{_C_RESET}{tail}",
+                flush=True,
+            )
+        return elapsed
+
+
+def stage_ledger() -> list[str]:
+    """Per-stage totals for the end-of-run block."""
+    if not _STAGE_TIMES:
+        return []
+    rows = []
+    total = 0.0
+    for stage in _STAGE_ORDER:
+        entries = _STAGE_TIMES.get(stage)
+        if not entries:
+            continue
+        secs = sum(e[0] for e in entries)
+        total += secs
+        worst = max(e[0] for e in entries)
+        counts: dict[str, int] = {}
+        for _, status, _ts in entries:
+            key = status.split("(")[0].strip().lower() or status
+            counts[key] = counts.get(key, 0) + 1
+        mix = "  ".join(f"{k}×{v}" for k, v in sorted(counts.items()))
+        rows.append(
+            f"  {_stage_label(stage):<14}{len(entries):>4} call   "
+            f"{secs:>8.0f}s   {secs / len(entries):>6.0f}s avg   "
+            f"{worst:>6.0f}s max   {mix}")
+
+    out = ["", "  " + "─" * 78,
+           f"  {'STAGE':<14}{'':>4}       {'TOTAL':>8}   {'MEAN':>10}   "
+           f"{'WORST':>10}   OUTCOMES",
+           "  " + "─" * 78]
+    out.extend(rows)
+    out.append("  " + "─" * 78)
+    out.append(f"  {'WALL CLOCK':<14}{total:>28.0f}s")
+    out.append("  " + "─" * 78)
+    return out
+
+
+def print_stage_ledger() -> None:
+    for line in stage_ledger():
+        print(line, flush=True)
 
 
 # ── Distiller result summary ────────────────────────────────────────────

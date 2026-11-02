@@ -158,33 +158,89 @@ def _strip_fences(text: str) -> str:
     return text
 
 
-def _extract_json_object(text: str) -> tuple[dict | None, list[str]]:
+def _repair_json(body: str) -> str:
+    """Fix the two breakages models actually produce, without guessing.
+
+    Trailing commas and raw control characters (a literal newline or tab
+    inside a string) are the only repairs applied. Neither can change what
+    the object means; both make ``json.loads`` reject an otherwise correct
+    document.
+    """
+    # Trailing commas before a closing brace or bracket.
+    body = re.sub(r",(\s*[}\]])", r"\1", body)
+    # Raw control characters inside strings must be escaped to be legal JSON.
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in body:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            elif ch in "\n\r\t":
+                out.append({"\n": "\\n", "\r": "\\r", "\t": "\\t"}[ch])
+                continue
+        elif ch == '"':
+            in_string = True
+        out.append(ch)
+    return "".join(out)
+
+
+def _extract_json_object(text: str,
+                         warnings: list[str] | None = None
+                         ) -> tuple[dict | None, list[str]]:
+    """Locate and parse the JSON object inside a model response.
+
+    Narrative around the object is recorded as a warning, not an error. A
+    model that writes "Here is the result:" and then a complete, correct
+    object has done its job; failing it for the sentence made every
+    well-behaved model look broken and made model comparison meaningless.
+    Only text that prevents a parse is fatal.
+
+    ``warnings`` is appended to in place when the caller wants the narrative
+    kept for the record.
+    """
     s = _strip_fences(text.strip())
     errs: list[str] = []
     start = s.find("{")
     end = s.rfind("}")
     if start == -1 or end == -1 or end <= start:
         return None, ["no_json_object"]
+
+    prose = []
     if s[:start].strip():
-        errs.append(f"prose_before_json:{s[:start].strip()[:40]!r}")
+        prose.append(f"prose_before_json:{s[:start].strip()[:40]!r}")
     if s[end + 1:].strip():
-        errs.append(f"prose_after_json:{s[end+1:].strip()[:40]!r}")
+        prose.append(f"prose_after_json:{s[end+1:].strip()[:40]!r}")
+
+    body = s[start:end + 1]
     try:
-        obj = json.loads(s[start:end + 1])
+        obj = json.loads(body)
     except json.JSONDecodeError as e:
-        return None, [f"json_parse:{e.msg}@{e.pos}"]
+        repaired = _repair_json(body)
+        try:
+            obj = json.loads(repaired)
+            prose.append(f"repaired_json:{e.msg}@{e.pos}")
+        except json.JSONDecodeError as e2:
+            return None, [f"json_parse:{e2.msg}@{e2.pos}"]
+
     if not isinstance(obj, dict):
         return None, ["top_level_not_object"]
+
+    if warnings is not None:
+        warnings.extend(prose)
     return obj, errs
 
 
 def _check_json(stage: str, spec: StageSpec, raw: str,
                 expected_hash: str | None) -> GateResult:
-    obj, errs = _extract_json_object(raw)
+    warnings: list[str] = []
+    obj, errs = _extract_json_object(raw, warnings)
     if obj is None:
         return GateResult(False, stage, errors=errs)
-
-    warnings: list[str] = []
 
     for key in spec.required:
         if _find(obj, key) is None:

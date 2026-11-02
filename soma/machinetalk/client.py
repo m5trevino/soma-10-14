@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import http.client
 import inspect
+import os
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 
@@ -148,7 +150,19 @@ class EngineClient:
         self.timeout = 180.0
 
     def model_for(self, stage: str) -> str:
-        return "turnkey"
+        """Name the model the next call will use.
+
+        This used to return the literal string "turnkey", which appeared in
+        every progress line and summary table as though it were a model. The
+        rotator can say which card it is about to serve without consuming it.
+        """
+        try:
+            info = self._tk._sdk.rotator.peek_model(stage)
+            return info.get("model_id") or "unknown"
+        except Exception:
+            # A profile with no deck is a configuration error the call itself
+            # will surface; the display should not crash first.
+            return "unknown"
 
     # A DNS failure cannot be fixed by waiting: the host does not resolve at
     # all, so every retry fails the same way. Give it one quick second chance

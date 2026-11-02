@@ -52,6 +52,21 @@ from . import progress
 # ── Stage-1 stages that drive the one-line spinner ───────────────────────
 _LIVE_STAGES = ("distiller", "introbeaver", "planbeaver", "outrobeaver")
 
+# Stage 1 handoff: each stage consumes the output of the one before it.
+_PREVIOUS_STAGE = {
+    "introbeaver": "distiller",
+    "planbeaver": "introbeaver",
+    "outrobeaver": "planbeaver",
+}
+
+# Everything after a stage, so a failure can stop the chain instead of
+# letting later stages invent input.
+_DOWNSTREAM = {
+    "distiller": ("introbeaver", "planbeaver", "outrobeaver"),
+    "introbeaver": ("planbeaver", "outrobeaver"),
+    "planbeaver": ("outrobeaver",),
+}
+
 # Per-session SOMA databases: <repo>/somas/<session_id>/soma.json
 SOMAS_DIR = Path(__file__).resolve().parents[2] / "somas"
 
@@ -319,17 +334,57 @@ class Engine:
 
     # -- stage 1: one chatset, all 4 beaver stages in order ------------------
 
-    def _beaver_payload(self, cs: ChatSet, *, extra: dict | None = None) -> dict:
+    def _beaver_payload(self, cs: ChatSet, *, stage: str = "",
+                        extra: dict | None = None) -> dict:
+        """Build the machine-talk payload for one beaver stage.
+
+        Stage 1 is a chain, not four independent calls. The distiller reads
+        the raw transcript; each later beaver reads the *previous* stage's
+        output plus whatever source it needs for provenance.
+
+        Sending ``raw_chat_set`` to all four meant introbeaver re-parsed the
+        noisy conversation the distiller had already cleaned, and planbeaver
+        planned against raw text instead of an extraction. Every stage paid
+        full attention cost for input the pipeline had already distilled.
+
+        ``raw_chat_set`` is still attached for the stages that must verify
+        against the transcript, because the provenance gate resolves quoted
+        text back to the message it came from.
+        """
         payload = {
             "session_id": cs.session_id,
             "chatset_id": cs.chatset_id,
             "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "chatset_hash": cs.chatset_hash,
-            "raw_chat_set": cs.raw_chat_set,
         }
+
+        if stage == "distiller" or not stage:
+            payload["raw_chat_set"] = cs.raw_chat_set
+        else:
+            # The stage before this one wrote its output to the artifact dir.
+            previous = _PREVIOUS_STAGE.get(stage)
+            upstream = self._load_artifact(cs.chatset_id, previous) if previous else None
+            if previous:
+                payload[f"{previous}_output"] = upstream
+                payload["upstream_stage"] = previous
+            # Verbatim source, so a quoted sentence can be traced to a turn.
+            payload["raw_chat_set"] = cs.raw_chat_set
+            if not upstream:
+                payload["upstream_missing"] = previous
+
         if extra:
             payload.update(extra)
         return payload
+
+    def _upstream_output(self, cs: ChatSet, stage: str) -> dict | None:
+        """The parsed output of the stage immediately before ``stage``."""
+        previous = _PREVIOUS_STAGE.get(stage)
+        if not previous:
+            return None
+        obj = self._load_artifact(cs.chatset_id, previous)
+        if isinstance(obj, dict) and isinstance(obj.get(f"{previous}_output"), dict):
+            return obj[f"{previous}_output"]
+        return obj if isinstance(obj, dict) else None
 
     def _run_chatset_stage(self, cs: ChatSet, stage: str,
                            worker: int, payload: dict | None = None,
@@ -359,31 +414,28 @@ class Engine:
         t0 = time.monotonic()
         spinner_label = f"{stage} {sid} CS{cs.source_chunk_id or n} {model}"
         is_stage1 = stage in _LIVE_STAGES
-        if stage == "distiller" and self._print is progress.emit:
-            # Show the distiller's processing steps on a ~30 s cadence while
-            # the single LLM call runs underneath.
-            prog = progress.DistillerProgress(target=30.0)
-            prog.start()
+
+        # One line per stage, owned entirely by the timer: it starts the
+        # clock, shows the live state, and closes with the real outcome.
+        # The old spinner is deliberately not started here — two owners drew
+        # two lines per stage and the spinner froze on "✓" even for failures.
+        timer = progress.StageTimer(stage, sid, cs.source_chunk_id or n,
+                                    cs.chars, model=model)
+        timer.start()
+        self._stage_timer = timer
+
+        if is_stage1:
             try:
                 res = self.client.call_stage(
                     stage, session_id=sid, chatset_id=cs.chatset_id,
                     chunk=chunk, contracts=contracts, payload=payload,
-                    expected_hash=cs.chatset_hash,
+                    expected_hash=cs.chatset_hash if stage in
+                    ("distiller", "introbeaver") else None,
                     soma=self._soma, raw_chat_set=cs.raw_chat_set,
                 )
-            finally:
-                prog.finish()
-        elif is_stage1:
-            res = self._with_spinner(
-                spinner_label,
-                self.client.call_stage,
-                stage, session_id=sid, chatset_id=cs.chatset_id,
-                chunk=chunk, contracts=contracts, payload=payload,
-                expected_hash=cs.chatset_hash if stage in
-                ("distiller", "introbeaver") else None,
-                soma=self._soma, raw_chat_set=cs.raw_chat_set,
-                live_stage=stage,
-            )
+            except BaseException:
+                timer.finish("CRASHED")
+                raise
         else:
             # Timeout watcher for non-stage1
             self._watch_start = t0
@@ -404,10 +456,23 @@ class Engine:
                     ("distiller", "introbeaver") else None,
                     live_stage=stage,
                 )
+            except BaseException:
+                timer.finish("CRASHED")
+                raise
             finally:
                 stop_event.set()
                 watcher.join(timeout=0.5)
         rec, gate = res.record, res.record.gate or GateResult(skipped=False, verdict="UNKNOWN", reasons=["Stage exhausted"], errors=[], parsed=None)
+
+        # The timer closes here, after the call returns and before any output
+        # is written, so the reported duration is the model call itself.
+        if is_done(gate):
+            _stage_status = "SKIPPED" if gate.skipped else "DONE"
+        elif is_hard_block(gate):
+            _stage_status = f"BLOCKED {gate.verdict or ''}".strip()
+        else:
+            _stage_status = f"FAILED {gate.first_reason() or ''}".strip()
+        timer.finish(_stage_status)
         latency = (time.monotonic() - t0) * 1000
         with self._manifest_lock:
             self.manifest.add(rec, gate)
@@ -483,17 +548,13 @@ class Engine:
             if gate.skipped:
                 self.log.skip(stage, session=sid, chatset=n,
                               detail=f"chars_in={cs.chars} ms={latency:.0f} model={rec.model}")
-                self._print(f"  -[{stage.upper()}]- [SKIPPED] chars_in={cs.chars:,} "
-                            f"out={len(rec.raw_response or ''):,} "
-                            f"{latency / 1000:.1f}s  model={rec.model or 'N/A'}")
+
             else:
                 verdict_label = ("" if gate.verdict.lower() in ("false", "", "0", "no")
                                  else f" verdict={gate.verdict}")
                 self.log.done(stage, session=sid, chatset=n,
                                detail=f"chars_in={cs.chars} ms={latency:.0f} model={rec.model}{verdict_label}")
-                self._print(f"  -[{stage.upper()}]- [DONE] chars_in={cs.chars:,} "
-                            f"out={len(rec.raw_response or ''):,} "
-                            f"{latency / 1000:.1f}s  model={rec.model or 'N/A'}")
+
             if gate.parsed is not None:
                 self._save_artifact(cs.chatset_id, stage, gate.parsed)
             # ---- Soma graph writes (NEW: legacy pipeline compatibility) ----
@@ -530,19 +591,14 @@ class Engine:
                             artifact=str(p.relative_to(self.out)))
             self.log.block(stage, session=sid, chatset=n,
                            detail=f"verdict={gate.verdict} models={len(rec.attempts)}")
-            self._print(f"  -[{stage.upper()}]- [BLOCKED] verdict={gate.verdict or 'BLOCKED'} "
-                        f"chars_in={cs.chars:,} {latency / 1000:.1f}s  "
-                        f"model={rec.model or 'N/A'}")
+
         else:
-            reason = gate.first_reason()
             self.ck.cs_mark(sid, n, stage, FAILED, model=rec.model,
                             errors=gate.reasons[:300],
                             artifact=str(p.relative_to(self.out)))
             self.log.fail(stage, session=sid, chatset=n,
                           detail=f"models={len(rec.attempts)} errors={gate.reasons[:80]}")
-            self._print(f"  -[{stage.upper()}]- [FAILED] {reason} "
-                        f"chars_in={cs.chars:,} {latency / 1000:.1f}s  "
-                        f"model={rec.model or 'N/A'}")
+
         return False
 
     def run_chatset(self, cs: ChatSet, worker: int = 0) -> dict:
@@ -622,7 +678,7 @@ class Engine:
             try:
                 ok = self._run_chatset_stage(
                     cs, stage, worker,
-                    payload=self._beaver_payload(cs, extra=extra),
+                    payload=self._beaver_payload(cs, stage=stage, extra=extra),
                     chunk=chunk)
             except Exception as exc:
                 detail = f"{type(exc).__name__}: {exc}"
@@ -642,6 +698,24 @@ class Engine:
                     for s in ("introbeaver", "planbeaver", "outrobeaver"):
                         result[s] = "SKIPPED"
                     return result
+
+            # Stage 1 is a chain: a stage with no upstream has nothing to
+            # work on. Previously a failed distiller still let introbeaver
+            # run, and because the payload carried raw_chat_set as a
+            # fallback it re-extracted the raw conversation and reported
+            # DONE — which reads as a healthy chatset that had no signal.
+            if not ok:
+                downstream = _DOWNSTREAM.get(stage, ())
+                for s in downstream:
+                    if s in _all_stages and s in _run_stages:
+                        self.ck.cs_mark(sid, n, s, SKIPPED,
+                                        errors=f"upstream {stage} did not "
+                                               f"complete")
+                        result[s] = SKIPPED
+                        self._print(
+                            f"  ⊘ {s.upper()} skipped: upstream {stage} "
+                            f"did not complete")
+                return result
 
         return result
 
@@ -712,6 +786,7 @@ class Engine:
             total_sets = cs0.total_sets or len(s_jobs)
             self._print(progress.session_header(sid, total_sets))
 
+        progress.stage_clock_reset()
         label = "STAGE 1 (FORCE)" if self.force else "STAGE 1: INGESTION"
         # Print session name, total chatsets, current index before first stage
         session_id = session_jobs.get(
@@ -734,9 +809,14 @@ class Engine:
                 f = pool.submit(self.run_chatset, cs, i)
                 futs[f] = cs
             completed = 0
+            # How many chatsets this run is doing, which is not the same as
+            # how many the session contains.
+            run_total = len(jobs)
+            run_position: dict[str, int] = {}
             for f in as_completed(futs):
                 cs = futs[f]
                 completed += 1
+                run_position[cs.chatset_id] = completed
                 self._print(f"Chatset {completed}/{len(jobs)} "
                             f"({cs.source_chunk_id or cs.set_number}) finished. "
                             f"Total characters: {cs.chars:,}")
@@ -803,14 +883,17 @@ class Engine:
                     sd = self.ck.cs_stage(sid, n, sn)
                     if sd.get("status") not in ("PENDING", "RUNNING"):
                         stages_data[sn] = sd
-                self._print(progress.chatset_table(n, cs.total_sets or len(cs.chatsets),
-                                                   stages_data,
-                                                   gateway_map=self.gateway_map))
+                self._print(progress.chatset_table(
+                    n, cs.total_sets or len(cs.chatsets), stages_data,
+                    gateway_map=self.gateway_map,
+                    position=run_position.get(cs.chatset_id)))
                 self._print(_DIVIDER)
                 self._print()
-        # Print overall summary
+        # Print overall summary, then where the wall-clock time actually went.
         self._print(progress.session_summary(
             counts["done"], counts["failed"], counts["skipped"], len(jobs)))
+        for line in progress.stage_ledger():
+            self._print(line)
         # The console summary above never reaches the master log (that file is
         # written by StageLogger, not stdout), so record the same tally there.
         self.log.summary(session=session_id, done=counts["done"],
