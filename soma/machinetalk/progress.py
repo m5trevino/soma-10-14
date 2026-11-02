@@ -443,6 +443,91 @@ class _LiveLine:
         _flush_deferred()
 
 
+class LiveTicker:
+    """One terminal line, redrawn in place while a call is in flight.
+
+    Owns exactly one line. Other output must clear() first, or its
+    carriage-return redraws will land on top of the printed text.
+
+    Disabled when stdout is not a terminal: a pipe has no carriage return,
+    so redrawing there would emit one line per tick.
+    """
+
+    def __init__(self, text_fn, interval: float = 0.5) -> None:
+        self._text_fn = text_fn
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread: "threading.Thread | None" = None
+        self._width = 0
+        self._held = False
+        self._enabled = sys.stdout.isatty()
+
+    def start(self) -> None:
+        if not self._enabled:
+            return
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="stage-ticker")
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            self._draw()
+
+    def _draw(self) -> None:
+        try:
+            text = self._text_fn()
+        except Exception:
+            return
+        with _io_lock:
+            if self._held:
+                return
+            pad = " " * max(0, self._width - len(text))
+            self._width = max(self._width, len(text))
+            sys.stdout.write("\r" + text + pad)
+            sys.stdout.flush()
+
+    def clear(self) -> bool:
+        """Erase the line so a normal print can use it."""
+        if not self._enabled:
+            return False
+        with _io_lock:
+            if self._held:
+                return False
+            self._held = True
+            sys.stdout.write("\r" + " " * self._width + "\r")
+            sys.stdout.flush()
+            return True
+
+    def redraw(self) -> None:
+        with _io_lock:
+            self._held = False
+        self._draw()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        if self._enabled and self._width:
+            with _io_lock:
+                sys.stdout.write("\r" + " " * self._width + "\r")
+                sys.stdout.flush()
+            self._width = 0
+
+
+# The ticker currently owning the bottom line, if any.
+_ticker: "LiveTicker | None" = None
+
+
+def print_live(*args, **kwargs) -> None:
+    """Print without destroying the live line underneath."""
+    held = _ticker.clear() if _ticker is not None else False
+    with _io_lock:
+        print(*args, **kwargs)
+        sys.stdout.flush()
+    if held and _ticker is not None:
+        _ticker.redraw()
+
+
 def _flush_deferred() -> None:
     """Print output queued while a spinner owned the line."""
     while True:
@@ -454,12 +539,12 @@ def _flush_deferred() -> None:
 
 
 def emit(*args, **kwargs) -> None:
-    """Print normally, or queue while a stage spinner owns the line."""
+    """Print normally, preserving whatever live line is on screen."""
     with _io_lock:
         if _active_line is not None:
             _deferred.append((args, kwargs))
             return
-        print(*args, **kwargs)
+    print_live(*args, **kwargs)
 
 
 def spin(label: str, fn, *args, **kwargs):
@@ -666,6 +751,13 @@ class StageTimer:
         self._started = time.monotonic()
         stage_clock_start(self.stage)
 
+        # The ticker owns the bottom line for every stage. Without it a
+        # multi-minute call is indistinguishable from a hang: the step fill
+        # stops after 30 s and then nothing moves.
+        global _ticker
+        _ticker = LiveTicker(self._line, interval=0.5)
+        _ticker.start()
+
         if self._is_distiller:
             with _io_lock:
                 print(
@@ -681,42 +773,34 @@ class StageTimer:
             self._thread.start()
             return
 
-        # Later stages are short enough that a single live line is the whole
-        # story: stage, model, elapsed.
+        # Later stages have no step fill, so the ticker is the whole story.
         self._thread = threading.Thread(
             target=self._spin, daemon=True, name=f"spin-{self.stage}")
         self._thread.start()
 
-    def _spin(self) -> None:
-        """Redraw one line in place once per second.
+    def _line(self) -> str:
+        """Live bottom line, rendered fresh on every tick."""
+        elapsed = time.monotonic() - self._started
+        model = f" · {self.model}" if self.model else ""
+        return f"  … {self.label}{model} [⏳ {elapsed:.1f}s elapsed]"
 
-        Only when stdout is a terminal. Piped or captured output cannot
-        interpret a carriage return, so every frame became a new line and a
-        two-minute call emitted hundreds of near-identical rows.
+    def _spin(self) -> None:
+        """Keep the ticker alive when no step fill is running.
+
+        On a terminal the ticker redraws itself; this loop only needs to
+        notice the stop. Without a terminal there is nothing to redraw in
+        place, so the elapsed time is printed on a widening interval.
         """
-        frames = _SPINNER_FRAMES
-        interactive = sys.stdout.isatty()
-        idx = 0
-        width = 0
-        model = f" {self.model}" if self.model else ""
-        while not self._stop.wait(_SPINNER_TICK):
-            glyph = frames[idx % len(frames)]
-            idx += 1
-            if not interactive:
-                # No terminal: say it once, then stay quiet until it ends.
-                if idx == 1:
-                    with _io_lock:
-                        print(f"  … {self.label} CS{self.chatset}{model}",
-                              flush=True)
-                continue
-            elapsed = time.monotonic() - self._started
-            body = (f"  {glyph} {self.label} CS{self.chatset}{model} "
-                    f"{elapsed:.0f}s")
-            pad = " " * max(0, width - len(body))
-            width = max(width, len(body))
-            with _io_lock:
-                sys.stdout.write("\r" + body + pad)
-                sys.stdout.flush()
+        if not sys.stdout.isatty():
+            for mark in (5, 15, 30, 60, 120, 300, 600, 900, 1800, 3600):
+                wait = mark - (time.monotonic() - self._started)
+                if self._stop.wait(max(0.0, wait)):
+                    return
+                print_live(f"  … {self.label}"
+                           f"{' · ' + self.model if self.model else ''} "
+                           f"[⏳ {mark}s elapsed]")
+            return
+        self._stop.wait()
 
     def _distiller_steps(self) -> None:
         """The 11-step fill for the one call that runs for minutes.
@@ -734,29 +818,26 @@ class StageTimer:
                 return
             dots = "." * max(3, width - len(step))
             elapsed = time.monotonic() - self._started
-            with _io_lock:
-                print(
-                    f"  {_C_DIM}{_timestamp()}{_C_RESET} "
-                    f"{_C_DIM}[{i:02d}/{n}]{_C_RESET} "
-                    f"{_C_CYAN}{step}{_C_RESET} "
-                    f"{_C_DIM}{dots} {elapsed:>4.0f}s{_C_RESET}",
-                    flush=True,
-                )
+            # print_live clears the ticker, prints, then redraws it below, so
+            # the step line lands above the live timer instead of on top of it.
+            print_live(
+                f"  {_C_DIM}{_timestamp()}{_C_RESET} "
+                f"{_C_GREEN}✓{_C_RESET} "
+                f"{_C_DIM}[{i:02d}/{n}]{_C_RESET} "
+                f"{_C_CYAN}{step}{_C_RESET} "
+                f"{_C_DIM}{dots} {elapsed:>4.0f}s{_C_RESET}")
 
-        # Steps are done but the model has not answered. Say so, once per
-        # minute, instead of repeating the last step.
+        # Steps are done but the model has not answered. The ticker keeps
+        # counting, so only a coarse reminder is added.
         last = 0.0
         while not self._stop.wait(1.0):
             elapsed = time.monotonic() - self._started
             if elapsed - last < 60:
                 continue
             last = elapsed
-            with _io_lock:
-                print(
-                    f"  {_C_DIM}{_timestamp()}   … {self.label} still "
-                    f"waiting on the model ({elapsed:.0f}s){_C_RESET}",
-                    flush=True,
-                )
+            print_live(
+                f"  {_C_DIM}{_timestamp()}   … {self.label} still "
+                f"waiting on the model ({elapsed:.0f}s){_C_RESET}")
 
     def finish(self, status: str, detail: str = "") -> float:
         """Stop the live line and print the stage's real result."""
@@ -764,12 +845,20 @@ class StageTimer:
         if self._thread is not None:
             self._thread.join(timeout=3.0)
 
+        # The ticker holds the bottom line; it must go before the result
+        # prints or the result lands on top of a half-drawn timer.
+        global _ticker
+        if _ticker is not None:
+            _ticker.stop()
+            _ticker = None
+
+        elapsed = stage_clock_done(self.stage, status)
+
         if not self._is_distiller and sys.stdout.isatty():
             with _io_lock:
                 sys.stdout.write("\r" + " " * 100 + "\r")
                 sys.stdout.flush()
 
-        elapsed = stage_clock_done(self.stage, status)
         glyph, colour = _verdict_glyph(status)
         tail = f"  {_C_DIM}{detail}{_C_RESET}" if detail else ""
         with _io_lock:
