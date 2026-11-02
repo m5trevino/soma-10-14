@@ -52,6 +52,17 @@ BASE_PATH_FILE = DATA_DIR / ".base_path"
 PORT = 9877
 SOMA_PKG = SOMA_DIR / "soma"
 SOMA_RUNNER = SOMA_PKG / "run_engine.py"
+
+# The banner lives beside the engine so the CLI and the board render the same
+# art from one source.
+if str(SOMA_PKG) not in sys.path:
+    sys.path.insert(0, str(SOMA_PKG))
+try:
+    from banner import print_banner
+except ImportError:  # a missing banner must never stop a run
+    def print_banner(color: bool | None = None) -> None:
+        return None
+
 def ensure_debug_dir():
     """Create the debug directory."""
     Path(DEBUG_DIR).mkdir(parents=True, exist_ok=True)
@@ -239,6 +250,8 @@ def run_pipeline(paths: list[str], full_objects: list[dict] | None = None,
         print("  Place a profile JSON in soma/turn-key-profiles/")
         print("  Or use: python run_sessions.py --profile /path/to/profile.json")
         return
+
+    print_banner()
 
     print(f"\n  Profile: {profile}")
     print(f"  Sessions: {len(paths)}")
