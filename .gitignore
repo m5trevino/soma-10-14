@@ -111,3 +111,6 @@ soma/workspaces/
 
 # === Profiles (contain engine credentials) ===
 turn-key-profile/
+
+# === Credentials ===
+.env

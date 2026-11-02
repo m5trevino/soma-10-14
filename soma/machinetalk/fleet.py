@@ -29,11 +29,14 @@ hash. Python validates -- never the LLM.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .hashes import canonical_json, chatset_hash_for
+from .hashes import (PlanNonceError, canonical_json, chatset_hash_for,
+                     extraction_hash_for, load_extraction_lists, plan_hash_for,
+                     plan_nonce)
 
 FLEET_DIR = Path(__file__).resolve().parent.parent / "machine-talk"
 
@@ -186,4 +189,343 @@ def make_payload(*, session_id: str, chatset_id: str, raw_chat_set: list[dict],
         "raw_chat_set": raw_chat_set,
     }
     payload.update(extra)
+    return payload
+
+
+EXTRACTION_KINDS = ("persons", "orgs", "documents", "events")
+
+
+def _read_json(path: str | Path, label: str):
+    """Parse one JSON file; missing/unreadable/invalid files raise."""
+    p = Path(path)
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise FileNotFoundError(f"{label} not found: {p}") from None
+    except OSError as exc:
+        raise ValueError(f"{label} unreadable: {p} ({exc})") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} is not valid JSON: {p} ({exc})") from exc
+
+
+def _session_id_from_introbeaver(introbeaver) -> str | None:
+    if not isinstance(introbeaver, dict):
+        return None
+    candidates = [introbeaver.get("session_id")]
+    output = introbeaver.get("introbeaver_output")
+    if isinstance(output, dict):
+        candidates.append(output.get("session_id"))
+    for cand in candidates:
+        if isinstance(cand, str) and cand:
+            return cand
+    return None
+
+
+def _extraction_from_introbeaver(introbeaver) -> tuple[object | None, str]:
+    """Pull extraction data out of an introbeaver payload, if it carries any."""
+    if not isinstance(introbeaver, dict):
+        return None, "missing"
+    ext = introbeaver.get("extraction")
+    if isinstance(ext, (dict, list)) and ext:
+        return ext, "introbeaver_payload"
+    output = introbeaver.get("introbeaver_output")
+    if isinstance(output, dict):
+        entries = output.get("entries")
+        if isinstance(entries, list) and entries:
+            return {"entries": entries}, "introbeaver_output"
+    return None, "missing"
+
+
+def _extraction_from_files(entities_dir: str | Path) -> tuple[dict, str]:
+    """Load the four entity files; an empty source reads as missing."""
+    try:
+        lists = load_extraction_lists(entities_dir)
+    except FileNotFoundError:
+        return {}, "missing"
+    if not any(lists.get(kind) for kind in EXTRACTION_KINDS):
+        return {}, "missing"
+    return lists, "entity_files"
+
+
+def _extraction_counts(extraction) -> dict[str, int]:
+    """Item counts per entity kind (zero for kinds absent from the payload)."""
+    if not isinstance(extraction, dict):
+        return {"items": len(extraction) if isinstance(extraction, list) else 0}
+    return {kind: len(extraction[kind]) if isinstance(extraction.get(kind), list) else 0
+            for kind in EXTRACTION_KINDS}
+
+
+def build_planbeaver_payload(
+        introbeaver_path: str | Path | None = None,
+        distiller_path: str | Path = "/tmp/soma_distiller_chatset.json",
+        out_path: str | Path | None = None,
+        *,
+        session_id: str | None = None,
+        entities_dir: str | Path = "/tmp",
+        allow_empty_extraction: bool = False) -> dict:
+    """Build the combined planbeaver payload (tb-005 input) and optionally write it.
+
+    Sources:
+        distiller_path   -> raw_chat_set (source of truth); chatset_hash is
+                            recomputed here, never copied from a model echo.
+        introbeaver_path -> extraction, when the payload carries it
+                            (``extraction`` or ``introbeaver_output.entries``).
+        entities_dir     -> extraction fallback: the four entity files read by
+                            ``hashes.load_extraction_lists``.
+
+    Args:
+        introbeaver_path: Introbeaver payload JSON. When given it must exist;
+            when omitted only the entity files can supply the extraction.
+        distiller_path: Distiller chatset JSON array (the raw chat set).
+        out_path: If given, write the payload JSON to this path.
+        session_id: Explicit session id; otherwise taken from the introbeaver
+            payload, else derived from the chatset hash.
+        entities_dir: Directory holding soma_introbeaver_{kind}.json files.
+        allow_empty_extraction: Permit a payload whose extraction has no items.
+            Off by default so a missing upstream stage fails loudly.
+
+    Returns:
+        Payload dict with keys session_id, chatset_hash, extraction,
+        raw_chat_set, plus a provenance block describing every source.
+
+    Raises:
+        FileNotFoundError: distiller file (or a named introbeaver file) is
+            missing, or no extraction source exists and empty output is
+            not allowed.
+        ValueError: a source file is unreadable/invalid JSON, the raw chat set
+            is not a list, or an introbeaver-supplied chatset_hash disagrees
+            with the recomputed one.
+    """
+    raw_chat_set = _read_json(distiller_path, "distiller chatset")
+    if not isinstance(raw_chat_set, list):
+        raise ValueError(
+            f"distiller chatset must be a JSON array, got {type(raw_chat_set).__name__}: "
+            f"{distiller_path}")
+    chatset_hash = chatset_hash_for(raw_chat_set)
+
+    introbeaver = None
+    if introbeaver_path is not None:
+        introbeaver = _read_json(introbeaver_path, "introbeaver payload")
+        claimed = introbeaver.get("chatset_hash") if isinstance(introbeaver, dict) else None
+        if claimed and claimed != chatset_hash:
+            raise ValueError(
+                f"introbeaver chatset_hash {claimed} != recomputed {chatset_hash} "
+                f"for {distiller_path}")
+
+    if session_id:
+        resolved_session_id, session_id_source = session_id, "explicit"
+    else:
+        resolved_session_id = _session_id_from_introbeaver(introbeaver)
+        session_id_source = "introbeaver_payload" if resolved_session_id else "derived"
+        if not resolved_session_id:
+            resolved_session_id = f"sess-{chatset_hash[:12]}"
+
+    extraction, extraction_source = _extraction_from_introbeaver(introbeaver)
+    if extraction is None:
+        extraction, extraction_source = _extraction_from_files(entities_dir)
+    if extraction_source == "missing":
+        if not allow_empty_extraction:
+            raise FileNotFoundError(
+                "EXTRACTION_UNAVAILABLE: no extraction in the introbeaver payload "
+                f"({introbeaver_path or 'not supplied'}) and no entity files in "
+                f"{entities_dir} ({', '.join('soma_introbeaver_' + k + '.json' for k in EXTRACTION_KINDS)})"
+                " -- pass allow_empty_extraction=True for a placeholder extraction")
+        extraction = {kind: [] for kind in EXTRACTION_KINDS}
+
+    provenance = {
+        "extraction_source": extraction_source,
+        "extraction_counts": _extraction_counts(extraction),
+        "session_id_source": session_id_source,
+        "introbeaver_payload": str(introbeaver_path) if introbeaver_path else None,
+        "distiller_chatset": str(distiller_path),
+        "raw_chat_set_entries": len(raw_chat_set),
+    }
+    if isinstance(extraction, dict) and all(
+            isinstance(extraction.get(kind), list) for kind in EXTRACTION_KINDS):
+        provenance["extraction_hash"] = extraction_hash_for(extraction)
+
+    payload = {
+        "session_id": resolved_session_id,
+        "chatset_hash": chatset_hash,
+        "extraction": extraction,
+        "raw_chat_set": raw_chat_set,
+        "provenance": provenance,
+    }
+
+    if out_path is not None:
+        Path(out_path).write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8")
+
+    return payload
+
+
+def _plan_field(plan, name: str) -> str:
+    """The single distinct non-empty ``name`` value across the plan items.
+
+    Mirrors ``checkpoint.plan_field``; fleet deliberately stays independent of
+    the checkpoint module. One plan describes one run of one chatset, so items
+    that disagree mean the plan belongs to no single run and the value is
+    refused rather than guessed.
+    """
+    if not isinstance(plan, list):
+        raise ValueError(
+            f"plan must be a JSON array of plan items, got {type(plan).__name__}")
+    values = sorted({str(item.get(name)) for item in plan
+                     if isinstance(item, dict) and item.get(name)})
+    if len(values) > 1:
+        raise ValueError(f"plan items disagree on {name}: {', '.join(values)}")
+    return values[0] if values else ""
+
+
+# Fields the tb-006 input contract names that no allowed source supplies.
+OUTROBEAVER_CONTRACT_GAPS = ("final_artifact_state", "user_feedback")
+
+
+def build_outrobeaver_payload(
+        plan_path: str | Path = "/tmp/soma_planbeaver_plan.json",
+        distiller_path: str | Path = "/tmp/soma_distiller_chatset.json",
+        out_path: str | Path | None = None,
+        *,
+        introbeaver_path: str | Path | None = "/tmp/soma_introbeaver_payload.json",
+        entities_dir: str | Path = "/tmp",
+        session_id: str | None = None,
+        nonce: str = "",
+        allow_empty_extraction: bool = False) -> dict:
+    """Build the combined outrobeaver payload (tb-006 input) and write it.
+
+    Sources:
+        plan_path        -> plan (a planbeaver items array) and its stamped nonce.
+        distiller_path   -> raw_chat_set (source of truth); chatset_hash is
+                            recomputed here, never copied from a model echo.
+        introbeaver_path -> extraction when the payload carries it
+                            (``extraction`` or ``introbeaver_output.entries``),
+                            plus chatset_id; its chatset_hash must agree.
+        entities_dir     -> extraction fallback: the four entity files read by
+                            ``hashes.load_extraction_lists``.
+
+    Args:
+        plan_path: Planbeaver plan JSON (a list of plan items).
+        distiller_path: Distiller chatset JSON array (the raw chat set).
+        out_path: If given, write the payload JSON to this path.
+        introbeaver_path: Introbeaver payload JSON; when given it must exist.
+        entities_dir: Directory holding soma_introbeaver_{kind}.json files.
+        session_id: Explicit session id; otherwise taken from the plan, then
+            the introbeaver payload, else derived from the chatset hash.
+        nonce: Supplied nonce. Defaults to the nonce the plan items carry; a
+            supplied nonce that disagrees with the plan is rejected, so a stale
+            plan cannot be stamped with a fresh run's nonce.
+        allow_empty_extraction: Permit a payload whose extraction has no items.
+            Off by default so a missing upstream stage fails loudly.
+
+    Returns:
+        Payload dict with keys session_id, nonce, chatset_hash, plan_hash, plan,
+        extraction, raw_chat_set, plus a provenance block naming every source.
+
+    Raises:
+        FileNotFoundError: the plan or distiller file (or a named introbeaver
+            file) is missing, or no extraction source exists and an empty
+            extraction is not allowed.
+        ValueError: a source file is unreadable/invalid JSON, the plan is not a
+            list of objects or its items disagree on session_id/chatset_hash,
+            the raw chat set is not a list, or a chatset_hash in the plan or the
+            introbeaver payload disagrees with the recomputed one.
+        PlanNonceError: no nonce is supplied and the plan carries none, or the
+            supplied nonce disagrees with the plan's nonce.
+    """
+    plan = _read_json(plan_path, "planbeaver plan")
+    _plan_field(plan, "nonce")          # refuses a plan of mixed provenance
+
+    raw_chat_set = _read_json(distiller_path, "distiller chatset")
+    if not isinstance(raw_chat_set, list):
+        raise ValueError(
+            f"distiller chatset must be a JSON array, got {type(raw_chat_set).__name__}: "
+            f"{distiller_path}")
+    chatset_hash = chatset_hash_for(raw_chat_set)
+
+    plan_chatset_hash = _plan_field(plan, "chatset_hash")
+    if plan_chatset_hash and plan_chatset_hash != chatset_hash:
+        raise ValueError(
+            f"plan chatset_hash {plan_chatset_hash} != recomputed {chatset_hash} "
+            f"for {distiller_path}")
+
+    plan_nonce_value = plan_nonce(plan)
+    resolved_nonce = nonce or plan_nonce_value
+    if not resolved_nonce:
+        raise PlanNonceError("no nonce supplied and the plan carries none")
+    plan_hash = plan_hash_for(plan, resolved_nonce)
+    nonce_source = "supplied" if nonce else "plan"
+
+    introbeaver = None
+    if introbeaver_path is not None:
+        introbeaver = _read_json(introbeaver_path, "introbeaver payload")
+        claimed = introbeaver.get("chatset_hash") if isinstance(introbeaver, dict) else None
+        if claimed and claimed != chatset_hash:
+            raise ValueError(
+                f"introbeaver chatset_hash {claimed} != recomputed {chatset_hash} "
+                f"for {distiller_path}")
+
+    plan_session = _plan_field(plan, "session_id")
+    if session_id and plan_session and session_id != plan_session:
+        raise ValueError(
+            f"supplied session_id {session_id} != plan session {plan_session}")
+    resolved_session_id = session_id or plan_session
+    session_id_source = ("explicit" if session_id else "plan") if resolved_session_id else ""
+    if not resolved_session_id:
+        resolved_session_id = _session_id_from_introbeaver(introbeaver)
+        session_id_source = "introbeaver_payload" if resolved_session_id else "derived"
+        if not resolved_session_id:
+            resolved_session_id = f"sess-{chatset_hash[:12]}"
+
+    chatset_id = ""
+    if isinstance(introbeaver, dict) and isinstance(introbeaver.get("chatset_id"), str):
+        chatset_id = introbeaver["chatset_id"]
+
+    extraction, extraction_source = _extraction_from_introbeaver(introbeaver)
+    if extraction is None:
+        extraction, extraction_source = _extraction_from_files(entities_dir)
+    if extraction_source == "missing":
+        if not allow_empty_extraction:
+            raise FileNotFoundError(
+                "EXTRACTION_UNAVAILABLE: no extraction in the introbeaver payload "
+                f"({introbeaver_path or 'not supplied'}) and no entity files in "
+                f"{entities_dir} ({', '.join('soma_introbeaver_' + k + '.json' for k in EXTRACTION_KINDS)})"
+                " -- pass allow_empty_extraction=True for a placeholder extraction")
+        extraction = {kind: [] for kind in EXTRACTION_KINDS}
+
+    provenance = {
+        "extraction_source": extraction_source,
+        "extraction_counts": _extraction_counts(extraction),
+        "session_id_source": session_id_source,
+        "nonce_source": nonce_source,
+        "plan_path": str(plan_path),
+        "plan_items": len(plan),
+        "plan_hash": plan_hash,
+        "introbeaver_payload": str(introbeaver_path) if introbeaver_path else None,
+        "distiller_chatset": str(distiller_path),
+        "raw_chat_set_entries": len(raw_chat_set),
+        "contract_gaps": list(OUTROBEAVER_CONTRACT_GAPS),
+    }
+    if isinstance(extraction, dict) and all(
+            isinstance(extraction.get(kind), list) for kind in EXTRACTION_KINDS):
+        provenance["extraction_hash"] = extraction_hash_for(extraction)
+
+    payload = {
+        "session_id": resolved_session_id,
+        "nonce": resolved_nonce,
+        "chatset_hash": chatset_hash,
+        "plan_hash": plan_hash,
+        "plan": plan,
+        "extraction": extraction,
+        "raw_chat_set": raw_chat_set,
+        "provenance": provenance,
+    }
+    if chatset_id:
+        payload["chatset_id"] = chatset_id
+
+    if out_path is not None:
+        Path(out_path).write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8")
+
     return payload

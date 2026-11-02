@@ -56,6 +56,7 @@ PEACOCK_DIR = Path.home() / "peacock"
 # and the name carries the stage and outcome. The old rsync loop only mirrored
 # raw files and left them unlabelled.
 PEA_TOOL = SOMA_DIR / "tools" / "pea_sync.py"
+TUI_DIR = Path("/home/flintx/peacock-engine-tui-core")
 PEA_DEST = Path.home() / "pea-sessions"
 SYNC_SCRIPT = PEA_TOOL
 SYNC_PIDFILE = Path.home() / ".pea-sync.pid"
@@ -236,6 +237,17 @@ SPECS: list[Spec] = [
         command="python3 run_dashboard.py",
         probe=lambda: port_open(dashboard_port()),
         url=lambda: f"http://127.0.0.1:{dashboard_port()}",
+    ),
+    Spec(
+        key="tui",
+        title="Engine TUI",
+        target="terminal · opentui",
+        short="tui",
+        hint="q to quit",
+        cwd=TUI_DIR,
+        command="./start.sh",
+        probe=None,
+        url=None,
     ),
     Spec(
         key="soma",

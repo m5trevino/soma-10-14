@@ -167,46 +167,20 @@ def main() -> int:
 
 
 def _ensure_engine_auth(profile_path: str) -> str:
-    """Make sure a profile can authenticate against the engine.
+    """Read the engine URL and key from the environment, never from the profile.
 
-    Profiles built by the profile builder carry only deck and pipeline
-    settings — no engine URL and no key — so every inference call would come
-    back 401. Rather than requiring the key to be hand-added to each new
-    profile, fill the missing fields here, once, at load time.
+    Profiles are portable configuration: they carry a deck and pipeline
+    settings, and nothing secret. The engine URL and key come from
+    ``ENGINE_URL`` and ``ENGINE_KEY`` at run time, so no profile file, commit,
+    or shared copy ever contains a credential.
 
-    Values come from the environment when present, otherwise from any sibling
-    profile that already has them. The profile on disk is updated in place so
-    the next run does not have to guess again.
+    Returns the profile path unchanged when the environment supplies what is
+    needed. Prints a single warning when the key is absent, because otherwise
+    the failure surfaces later as 401s that look like model or gateway faults.
     """
-    try:
-        path = Path(profile_path).expanduser()
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"  [warn] cannot read profile {profile_path}: {exc}", flush=True)
-        return profile_path
-    if not isinstance(data, dict):
-        return profile_path
-
-    pipeline = data.setdefault("pipeline", {})
-    changed = False
-
-    if not pipeline.get("engineUrl") and not pipeline.get("engine_url"):
-        pipeline["engineUrl"] = _engine_url_from_env() or _engine_url_from_siblings(path)
-        changed = bool(pipeline["engineUrl"])
-
-    if not pipeline.get("engineKey") and not pipeline.get("engine_key"):
-        key = os.environ.get("ENGINE_KEY") or _engine_key_from_siblings(path)
-        if key:
-            pipeline["engineKey"] = key
-            changed = True
-
-    if changed:
-        try:
-            path.write_text(json.dumps(data, indent=2))
-            print(f"  profile: filled engine url/key in {path.name}", flush=True)
-        except OSError as exc:
-            print(f"  [warn] cannot update {path}: {exc}", flush=True)
-
+    if not os.environ.get("ENGINE_KEY"):
+        print("  [warn] ENGINE_KEY is not set; inference calls will return 401",
+              flush=True)
     return profile_path
 
 
