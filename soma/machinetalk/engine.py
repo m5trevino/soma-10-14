@@ -59,6 +59,43 @@ _PREVIOUS_STAGE = {
     "outrobeaver": "planbeaver",
 }
 
+def _payload_chars(payload: dict | None, fallback: int) -> int:
+    """Size of the upstream output a stage consumes, in characters.
+
+    Reporting the raw chat-set size for a chained stage overstates its input:
+    introbeaver reads the distiller's payload, not the conversation.
+    """
+    if not isinstance(payload, dict):
+        return fallback
+    for key, value in payload.items():
+        if not key.endswith("_output") or value is None:
+            continue
+        try:
+            from .hashes import canonical_json
+            return len(canonical_json(value))
+        except Exception:
+            return len(str(value))
+    return fallback
+
+
+def _verdict_label(gate) -> str:
+    """Human label for a gate verdict.
+
+    The distiller emits ``verdict: false`` to mean "do not skip". Printing
+    the raw value next to STATUS DONE reads as a failed stage, so the label
+    states the meaning instead of the encoding.
+    """
+    v = (gate.verdict or "").strip()
+    if gate.skipped:
+        reason = gate.skip_reason or v or "skipped"
+        return f"SKIP · {reason}"
+    if v.lower() in ("false", "", "0", "no"):
+        return "proceed"
+    if v.lower() in ("true", "1", "yes"):
+        return f"skip · {gate.skip_reason or 'true'}"
+    return v
+
+
 # Everything after a stage, so a failure can stop the chain instead of
 # letting later stages invent input.
 _DOWNSTREAM = {
@@ -407,9 +444,25 @@ class Engine:
                 return True
 
         self.ck.cs_mark(sid, n, stage, RUNNING)
-        model = self.client.model_for(stage)
+        # Resolve model and provider before the call so the telemetry block
+        # can name what is about to run, not only what answered.
+        route = self.client.route_for(stage)
+        model = route.get("model_id", "unknown")
+        provider = route.get("provider", "unknown")
         self.log.start(stage, session=sid, chatset=n, model=model,
                        detail=f"chars={cs.chars} hash={cs.chatset_hash[:16]}…")
+
+        # Telemetry opens before the call: a silent wait is indistinguishable
+        # from a hang, and an operator watching a two-minute stage needs the
+        # start time and the model id on screen.
+        # What this stage actually reads. The distiller reads the transcript;
+        # every later stage reads its predecessor's output, so its input is
+        # the size of that payload rather than the raw chat set.
+        payload_chars_in = _payload_chars(payload, cs.chars) if payload else cs.chars
+
+        self._print(progress.telemetry_header(
+            stage, sid, cs.source_chunk_id or n, payload_chars_in,
+            model, provider))
 
         t0 = time.monotonic()
         spinner_label = f"{stage} {sid} CS{cs.source_chunk_id or n} {model}"
@@ -473,6 +526,26 @@ class Engine:
         else:
             _stage_status = f"FAILED {gate.first_reason() or ''}".strip()
         timer.finish(_stage_status)
+
+        # Close the telemetry block with measured values. chars_out is the raw
+        # response length, which is what actually left the provider; the gate
+        # may reject some of it, and that is what `verdict` and `detail` say.
+        chars_out = len(rec.raw_response or "")
+        self._print(progress.telemetry_result(
+            stage,
+            elapsed=(time.monotonic() - t0),
+            chars_in=payload_chars_in,
+            chars_out=chars_out,
+            prompt_tokens=rec.prompt_tokens,
+            completion_tokens=rec.completion_tokens,
+            total_tokens=rec.total_tokens,
+            model=rec.model or model,
+            provider=provider,
+            verdict=_verdict_label(gate),
+            status=_stage_status,
+            detail=(gate.first_reason() if not is_done(gate) else ""),
+        ))
+
         latency = (time.monotonic() - t0) * 1000
         with self._manifest_lock:
             self.manifest.add(rec, gate)

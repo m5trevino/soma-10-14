@@ -341,8 +341,18 @@ def run_pipeline(paths: list[str], full_objects: list[dict] | None = None,
         cmd.append("--granular")
     if force:
         cmd.append("--force")
-    for sid, setnum in (only or []):
-        cmd.extend(["--only", f"{sid}:{setnum}"])
+    for spec in (only or []):
+        # Accept either a "session:set" string from the CLI or an already
+        # split (session, set) tuple from the interactive picker.
+        if isinstance(spec, str):
+            sid, _, setnum = spec.rpartition(":")
+            if not sid or not setnum.isdigit():
+                print(f"  Error: --only expects SESSION:SET, got {spec!r}")
+                return
+            cmd.extend(["--only", f"{sid}:{setnum}"])
+        else:
+            sid, setnum = spec
+            cmd.extend(["--only", f"{sid}:{setnum}"])
 
     exit_code = None
     try:
@@ -1468,6 +1478,15 @@ Examples:
                              "dashboard, each beaver, each build stage, codebase, manifest")
     parser.add_argument("--force", action="store_true",
                         help="Re-run stages even when the checkpoint says DONE")
+    parser.add_argument("--only", action="append", default=None,
+                        metavar="SESSION:SET",
+                        help="Run a single chatset, e.g. --only trevino.war.room:6 "
+                             "(repeatable). Pairs with --stage to inspect one "
+                             "stage of one chatset.")
+    parser.add_argument("--max-chatsets", type=int, default=None,
+                        help="Stop after this many chatsets")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="Parallel chatset workers (default 2)")
 
     args = parser.parse_args()
 
@@ -1477,6 +1496,29 @@ Examples:
 
     if args.progress:
         show_progress()
+        return
+
+    # --only: inspect one chatset directly, skipping every interactive prompt.
+    # This is the path used to verify a single stage's telemetry before
+    # running the rest of the pipeline.
+    if args.only:
+        result = load_queue(args.queue)
+        if result is None:
+            return
+        session_ids, full_objects = result
+        paths = resolve_sessions_from_ids(session_ids)
+        if not paths:
+            print("  No sessions resolved on disk.")
+            return
+        run_pipeline(
+            paths, full_objects if full_objects else [],
+            max_chatsets=args.max_chatsets,
+            workers=args.workers,
+            granular=args.granular,
+            force=args.force,
+            only=args.only,
+            stage=args.stage,
+        )
         return
 
     # --run-only: skip picker, use queue directly

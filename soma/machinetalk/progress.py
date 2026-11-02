@@ -544,6 +544,102 @@ def _verdict_glyph(status: str) -> tuple[str, str]:
     return "✗", _C_RED
 
 
+# ── Per-stage telemetry ────────────────────────────────────────────────
+#
+# One block per stage execution, printed immediately before the call and
+# completed after it returns. Every value is measured: the timestamps come
+# from the clock, the character counts from the strings, the tokens from the
+# provider's usage block. Nothing here is estimated.
+#
+# The block exists so a run can be read after the fact without guessing what
+# happened: which model served the call, whether it was the one announced,
+# how much text went in and came out, and what the gate decided.
+
+_TELEMETRY_WIDTH = 74
+
+
+def _rule(char: str = "─") -> str:
+    return "  " + _C_DIM + char * _TELEMETRY_WIDTH + _C_RESET
+
+
+def _field(label: str, value: str, colour: str = "") -> str:
+    colour = colour or _C_RESET
+    return f"  {_C_DIM}{label:<12}{_C_RESET}{colour}{value}{_C_RESET}"
+
+
+def telemetry_header(stage: str, session: str, chatset, chars_in: int,
+                     model: str, provider: str) -> str:
+    """The opening block for one stage execution, before the call."""
+    label = _stage_label(stage)
+    started = time.strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "",
+        _rule("═"),
+        f"  {_C_BOLD}{_C_CYAN}{label}{_C_RESET}"
+        f"{_C_DIM} · {stage}{_C_RESET}",
+        _rule(),
+        _field("started", started),
+        _field("session", session),
+        _field("chatset", f"CS{chatset}"),
+        _field("chars in", f"{chars_in:,}"),
+        _field("model", model or "unknown"),
+        _field("provider", provider or "unknown"),
+        _rule("═"),
+    ]
+    return "\n".join(lines)
+
+
+def telemetry_result(stage: str, *, elapsed: float, chars_in: int,
+                     chars_out: int, prompt_tokens: int,
+                     completion_tokens: int, total_tokens: int,
+                     model: str, provider: str, status: str,
+                     verdict: str = "", detail: str = "") -> str:
+    """The closing block for one stage execution, after it returns.
+
+    Tokens are reported exactly as the provider returned them. A zero means
+    the provider did not report usage, which is shown as ``—`` rather than
+    ``0`` so an absent measurement is not mistaken for an empty one.
+    """
+    glyph, colour = _verdict_glyph(status)
+
+    def tok(n: int) -> str:
+        return f"{n:,}" if n else "—"
+
+    ratio = ""
+    if chars_in and chars_out:
+        ratio = f"  {_C_DIM}({chars_out / chars_in:.2f}x){_C_RESET}"
+
+    # Reasoning models bill their thinking as completion tokens and then
+    # strip it from the message. A reply of 112 characters can carry 1,485
+    # completion tokens, which looks like a contradiction until it is
+    # labelled; without the note the operator reads it as a counting bug.
+    hidden = ""
+    if completion_tokens and chars_out:
+        per_tok = chars_out / completion_tokens
+        if per_tok < 1.5:
+            hidden = (f"  {_C_DIM}(reply shorter than token count — "
+                      f"thinking tokens are billed, not shown){_C_RESET}")
+
+    lines = [
+        _rule(),
+        _field("finished", time.strftime("%Y-%m-%d %H:%M:%S")),
+        _field("duration", f"{elapsed:.1f}s"),
+        _field("chars out", f"{chars_out:,}{ratio}"),
+        _field("tokens", f"prompt {tok(prompt_tokens)}  "
+                         f"completion {tok(completion_tokens)}  "
+                         f"total {tok(total_tokens)}{hidden}"),
+        _field("model", model or "unknown"),
+        _field("provider", provider or "unknown"),
+        _field("verdict", verdict or "—"),
+        _field("status", status, colour),
+    ]
+    if detail:
+        lines.append(_field("detail", detail[:96]))
+    lines.append(_rule("═"))
+    lines.append("")
+    return "\n".join(lines)
+
+
 class StageTimer:
     """One live line per stage, ending in that stage's real outcome.
 

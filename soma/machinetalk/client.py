@@ -173,13 +173,26 @@ class EngineClient:
         every progress line and summary table as though it were a model. The
         rotator can say which card it is about to serve without consuming it.
         """
+        return self.route_for(stage).get("model_id") or "unknown"
+
+    def route_for(self, stage: str) -> dict:
+        """Model id and provider for the next call, without consuming it.
+
+        The provider is the gateway the card belongs to (openrouter, merge,
+        xkiro, ollama, novita). Two models with the same id can behave
+        differently behind different gateways, so a telemetry block that
+        names only the model is ambiguous when something needs explaining.
+        """
         try:
             info = self._tk._sdk.rotator.peek_model(stage)
-            return info.get("model_id") or "unknown"
         except Exception:
             # A profile with no deck is a configuration error the call itself
             # will surface; the display should not crash first.
-            return "unknown"
+            return {"model_id": "unknown", "provider": "unknown"}
+        return {
+            "model_id": info.get("model_id") or "unknown",
+            "provider": info.get("gateway") or "unknown",
+        }
 
     # A DNS failure cannot be fixed by waiting: the host does not resolve at
     # all, so every retry fails the same way. Give it one quick second chance
