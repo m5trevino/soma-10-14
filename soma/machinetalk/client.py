@@ -16,6 +16,18 @@ from pathlib import Path
 from typing import Any
 
 
+# Stage 1 extracts. There is exactly one right answer to "which sentence is
+# the directive", so sampling a distribution over answers is wrong: the same
+# prompt against the same model returned 0, 7 and 0 verified entries on three
+# consecutive calls. Later stages compose plans and journals, where some
+# latitude is legitimate.
+_EXTRACTIVE_STAGES = frozenset({
+    "distiller", "introbeaver", "planbeaver", "outrobeaver",
+    "scout", "oc", "olc",
+})
+DEFAULT_EXTRACTIVE_TEMPERATURE = 0.0
+
+
 _STAGE_MAP = {
     "receptor": "distiller",
     "distiller": "distiller",
@@ -111,10 +123,15 @@ class TurnKeyClient:
         return initialize_sdk_with_profile(profile_path)
 
     def call(self, stage: str, messages: list[dict[str, str]],
-             pea_session: str | None = None) -> StageResult:
+             pea_session: str | None = None,
+             temperature: float | None = None) -> StageResult:
         mapped = _STAGE_MAP.get(stage, stage)
         start = time.monotonic()
         kwargs = {"pea_session": pea_session} if self._pea_kw else {}
+        # run_stage only sends temperature when it is not None, so passing it
+        # unconditionally is safe and makes unset the explicit default.
+        if temperature is not None:
+            kwargs["temperature"] = temperature
         raw = self._sdk.run_stage(mapped, messages, **kwargs)
         elapsed = (time.monotonic() - start) * 1000
 
@@ -173,7 +190,8 @@ class EngineClient:
 
     def _call_with_retry(self, stage: str, messages: list[dict[str, str]],
                          attempts: int = 10,
-                         pea_session: str | None = None) -> Any:
+                         pea_session: str | None = None,
+                         temperature: float | None = None) -> Any:
         """Retry transport failures that escape the TurnKey SDK.
 
         The SDK converts URLError/TimeoutError to SDKError and retries those,
@@ -190,7 +208,8 @@ class EngineClient:
         dns_failures = 0
         for attempt in range(attempts):
             try:
-                return self._tk.call(stage, messages, pea_session=pea_session)
+                return self._tk.call(stage, messages, pea_session=pea_session,
+                                     temperature=temperature)
             except TypeError:
                 # A signature mismatch is a code bug, not a transport failure.
                 # Retrying it ten times only burns the deck.
@@ -267,7 +286,11 @@ class EngineClient:
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_msg},
         ]
-        result = self._call_with_retry(stage, messages, pea_session=pea_session)
+        if temperature is None:
+            temperature = (DEFAULT_EXTRACTIVE_TEMPERATURE
+                           if stage in _EXTRACTIVE_STAGES else None)
+        result = self._call_with_retry(stage, messages, pea_session=pea_session,
+                                       temperature=temperature)
         gate = validate(stage, result.content, expected_hash=expected_hash)
 
         # ── provenance: the claim must exist in the source ──────────────
