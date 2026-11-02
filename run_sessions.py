@@ -1516,6 +1516,7 @@ Examples:
             workers=args.workers,
             granular=args.granular,
             force=args.force,
+            profile=args.profile,
             only=args.only,
             stage=args.stage,
         )
