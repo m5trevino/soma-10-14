@@ -352,22 +352,55 @@ class Engine:
 
     # -- artifact helpers ----------------------------------------------------
 
-    # -- artifact helpers ----------------------------------------------------
+    # -- stage handoff: Soma nodes -------------------------------------------
+    #
+    # Stages hand off through the graph, not through JSON files on disk. A
+    # file handoff left the pipeline's real state outside the store, so the
+    # only record of what introbeaver actually consumed was a directory that
+    # could be overwritten, deleted, or read by the next run without any
+    # provenance link to the node that produced it.
+    #
+    # Every stage writes one ``StageOutput`` node carrying its parsed payload,
+    # plus an edge from the node it consumed. Reading the upstream output is
+    # then a graph query with the same guarantees as everything else in Soma.
 
-    def _save_artifact(self, build: str, stage: str, obj) -> Path:
-        p = self.art_dir / build / f"{stage}.json"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(canonical_json(obj) if isinstance(obj, (dict, list))
-                       else str(obj))
-        tmp.replace(p)
-        return p
+    def _stage_node_id(self, build: str, stage: str) -> str:
+        return f"stage:{build}:{stage}"
+
+    def _save_artifact(self, build: str, stage: str, obj) -> str:
+        """Persist one stage's output as a Soma node; return its node id."""
+        node_id = self._stage_node_id(build, stage)
+        payload = obj if isinstance(obj, (dict, list)) else {"value": str(obj)}
+        props = {
+            "id": node_id,
+            "build": build,
+            "stage": stage,
+            "output": payload,
+            "written_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        with self._soma_lock:
+            self._soma.create_node("StageOutput", props)
+            # Link the chain so the newest node is traceable to its input.
+            # create_edge always inserts, so a re-run would stack a second
+            # identical edge; the graph should show one handoff per pair.
+            previous = _PREVIOUS_STAGE.get(stage)
+            if previous:
+                src = self._stage_node_id(build, previous)
+                if self._soma.get_node(src) is not None:
+                    existing = self._soma.get_edges(src)
+                    if not any(e.rel_type == "HANDOFF_TO"
+                               and e.target == node_id for e in existing):
+                        self._soma.create_edge(src, "HANDOFF_TO", node_id)
+            self._soma._persist()
+        return node_id
 
     def _load_artifact(self, build: str, stage: str):
-        p = self.art_dir / build / f"{stage}.json"
-        if p.exists():
-            return json.loads(p.read_text())
-        return None
+        """Read one stage's output node, or None when it has not run."""
+        node = self._soma.get_node(self._stage_node_id(build, stage))
+        if node is None:
+            return None
+        out = node.properties.get("output")
+        return out if isinstance(out, (dict, list)) else None
 
     # -- stage 1: one chatset, all 4 beaver stages in order ------------------
 
@@ -396,16 +429,29 @@ class Engine:
         }
 
         if stage == "distiller" or not stage:
+            # Only the distiller reads the conversation. It is the stage whose
+            # job is to reduce it; every later stage consumes that reduction.
             payload["raw_chat_set"] = cs.raw_chat_set
         else:
-            # The stage before this one wrote its output to the artifact dir.
+            # The stage before this one wrote its output to the graph.
             previous = _PREVIOUS_STAGE.get(stage)
-            upstream = self._load_artifact(cs.chatset_id, previous) if previous else None
+            upstream = self._upstream_output(cs, stage) if previous else None
             if previous:
+                # Hand over the stage's own body, not the wrapper that stores
+                # it. The node holds {"distiller_output": {...}}; sending the
+                # wrapper nests it twice and the next stage sees no fields
+                # where its contract says they should be.
                 payload[f"{previous}_output"] = upstream
                 payload["upstream_stage"] = previous
-            # Verbatim source, so a quoted sentence can be traced to a turn.
-            payload["raw_chat_set"] = cs.raw_chat_set
+
+            # raw_chat_set is deliberately NOT attached. Sending it made every
+            # downstream stage re-parse the transcript the distiller had
+            # already cleaned, paid attention cost for input the pipeline had
+            # reduced, and let a stage quietly re-extract from raw source when
+            # its upstream was missing.
+            #
+            # The provenance gate still needs the transcript, but it reads it
+            # from the ChatSet in the caller, not from the model's payload.
             if not upstream:
                 payload["upstream_missing"] = previous
 
@@ -765,12 +811,28 @@ class Engine:
                 ok = False
             else:
                 result[stage] = self.ck.cs_stage(sid, n, stage)["status"]
-            if not ok and stage == "distiller":
-                # Distiller skip still marks the rest SKIPPED.
-                if self.ck.cs_stage(sid, n, "distiller")["status"] == SKIPPED:
-                    for s in ("introbeaver", "planbeaver", "outrobeaver"):
-                        result[s] = "SKIPPED"
-                    return result
+            # ── skip policy ────────────────────────────────────────
+            # A distiller SKIP means the stage decided this turn carries no
+            # signal. Everything downstream extracts from what the distiller
+            # produced, so there is nothing to extract. Halt the chain here.
+            #
+            # This runs before any force/not-ok handling because a skip is a
+            # successful outcome, not a failure: it returns ok=True, so a
+            # guard written as "not ok" never fires. Under --force the
+            # checkpoint's SKIPPED marker is also ignored, which let
+            # introbeaver run on an empty upstream and report DONE.
+            if stage == "distiller" and is_done(gate) and gate.skipped:
+                reason = gate.skip_reason or gate.verdict or "SKIPPED"
+                for s in _DOWNSTREAM.get("distiller", ()):
+                    if s in _all_stages and s in _run_stages:
+                        self.ck.cs_mark(sid, n, s, SKIPPED,
+                                        errors=f"upstream distiller skipped "
+                                               f"({reason})")
+                        result[s] = SKIPPED
+                        self._print(
+                            f"  ⊘ {s.upper()} skipped: distiller skipped "
+                            f"({reason})")
+                return result
 
             # Stage 1 is a chain: a stage with no upstream has nothing to
             # work on. Previously a failed distiller still let introbeaver
@@ -1273,15 +1335,9 @@ class Engine:
                 # parse scout text report into a JSON artifact for OC
                 sc_raw = ""
                 sc_verdict = ""
-                sp = self.art_dir / build / "scout.json"
-                if sp.exists():
-                    sc_verdict = (json.loads(sp.read_text())
-                                  .get("scout_verdict", ""))
-                if sc_verdict:
-                    # re-read raw from last stage2-4 artifact md is overkill;
-                    # keep the parsed structure we just built
-                    pass
                 sc = self._load_artifact(build, "scout") or {}
+                if isinstance(sc, dict):
+                    sc_verdict = sc.get("scout_verdict", "") or sc_verdict
                 if not sc.get("violations"):
                     # rebuild from the markdown raw section
                     mdp = (self.out / "stage3" / f"{build}_scout.md")
@@ -1416,7 +1472,12 @@ def run(sessions: list[Session], *, out_dir: Path,
                  debug_dir=debug_dir, max_chatsets=max_chatsets,
                  step_mode=step_mode, soma_path=soma_file)
     if stage:
-        eng._stage = stage
+        # Accept a comma-separated list so a strict isolation run can execute
+        # a prefix of the pipeline (e.g. "distiller,introbeaver") without
+        # bringing the later stages along.
+        _stage_names = [s.strip() for s in str(stage).split(",") if s.strip()]
+        eng._stage = (_stage_names[0] if len(_stage_names) == 1
+                      else tuple(_stage_names))
     eng.granular = granular
     if len(sessions) == 1:
         build = sessions[0].session_id

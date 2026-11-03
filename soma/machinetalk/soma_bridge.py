@@ -34,6 +34,17 @@ def _now() -> str:
     return __import__('datetime').datetime.utcnow().isoformat()
 
 
+# Instruction type -> graph node type. The introbeaver classifies each entry
+# into one of these lanes; the lane is the node type, so a CONSTRAINT becomes
+# a Constraint node and not a generic intent.
+_SIGNAL_NODE_FOR = {
+    "CONSTRAINT": "Constraint",
+    "DIRECTIVE": "Directive",
+    "PREFERENCE": "Preference",
+    "QUESTION": "Question",
+}
+
+
 class SomaBridge:
     """Translates machine-talk stage artifacts into Soma graph nodes/edges."""
 
@@ -309,19 +320,43 @@ class SomaBridge:
 
         if stage == "introbeaver" and isinstance(parsed, dict):
             output = parsed.get("introbeaver_output", parsed)
-            intent = output.get("intent", "") if isinstance(output, dict) else ""
-            if intent:
-                nid = f"intent-{chatset_id}"
-                if self._soma.get_node(nid):
-                    self._soma.delete_node(nid)
-                self._soma.create_node("IntentNode", {
-                    "id": nid, "session_id": session_id, "chat_set_id": chatset_id,
-                    "intent_text": intent, "confidence": 0.9,
-                    "source_text": intent,
+            # The TB-004 output contract emits ``entries[]``, one per verbatim
+            # intent, each already classified. Reading a single ``intent``
+            # string found nothing on every real response, so the pipeline
+            # reported extraction success while writing no signal nodes.
+            entries = output.get("entries") or [] if isinstance(output, dict) else []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                text = entry.get("verbatim_text") or entry.get("text") or ""
+                if not text:
+                    continue
+                kind = (entry.get("instruction_type") or "").upper()
+                node_type = _SIGNAL_NODE_FOR.get(kind, "IntentNode")
+                eid = entry.get("entry_id") or f"{node_type.lower()}-{chatset_id}-{len(counts)}"
+                if self._soma.get_node(eid):
+                    self._soma.delete_node(eid)
+                self._soma.create_node(node_type, {
+                    "id": eid,
+                    "session_id": session_id,
+                    "chat_set_id": chatset_id,
+                    "chatset_id": chatset_id,
+                    "entry_id": eid,
+                    "instruction_type": kind,
+                    "text": text,
+                    "verbatim_text": text,
+                    "char_start": entry.get("char_start"),
+                    "char_end": entry.get("char_end"),
+                    "source_msg_index": entry.get("source_msg_index"),
+                    "confidence": entry.get("confidence"),
+                    "intent_key": entry.get("intent_key"),
+                    "entry_status": entry.get("entry_status"),
+                    "superseded_by": entry.get("superseded_by"),
                     "rationale": f"extracted by introbeaver ({model_id})",
                 })
-                self._soma.create_edge(chatset_id, "YIELDS", nid)
-                counts["IntentNode"] = 1
+                if self._soma.get_node(chatset_id):
+                    self._soma.create_edge(chatset_id, "YIELDS", eid)
+                counts[node_type] = counts.get(node_type, 0) + 1
 
         elif stage == "planbeaver" and isinstance(parsed, dict):
             output = parsed.get("planbeaver_output", parsed)

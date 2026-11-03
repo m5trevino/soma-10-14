@@ -247,13 +247,20 @@ def _check_json(stage: str, spec: StageSpec, raw: str,
             errs.append(f"missing:{key}")
 
     # Hash echo (only for stages that echo one).
+    #
+    # A wrong or absent hash is fatal, not a warning. The echo is how a stage
+    # attests which input it actually processed; a stage that reports a hash
+    # it was never given has not verified its own input, and downstream
+    # provenance cannot rely on anything it produced. Models cannot compute
+    # sha256, so an unverifiable echo is also the signature of a fabricated
+    # one.
     if spec.hash_key:
         echoed = _find(obj, spec.hash_key)
         if expected_hash is not None:
             if not isinstance(echoed, str) or not echoed:
-                warnings.append("missing_hash_echo")
+                errs.append("missing_hash_echo")
             elif echoed != expected_hash:
-                warnings.append(f"hash_mismatch:{echoed[:12]}!={expected_hash[:12]}")
+                errs.append(f"hash_mismatch:{echoed[:12]}!={expected_hash[:12]}")
         elif isinstance(echoed, str) and echoed:
             # No caller-expected hash (re-run): still require it be a sha256.
             if not re.fullmatch(r"[0-9a-f]{64}", echoed):

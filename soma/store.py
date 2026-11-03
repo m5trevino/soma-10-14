@@ -30,6 +30,15 @@ _NODE_TYPE_CHECK_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# The edges table lists its permitted relationship types the same way. Node
+# types widen automatically; relationship types did not, so introducing a new
+# edge type failed at insert time with a CHECK constraint error.
+_REL_TYPE_CHECK_RE = re.compile(
+    r"rel_type\s+TEXT\s+NOT\s+NULL\s+CHECK\s*\(\s*rel_type\s+IN\s*\("
+    r"(?P<types>[^)]*)\)\s*\)",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 def natural_key(value: Any) -> tuple:
     """Sort key that orders ``a.2`` before ``a.10``."""
@@ -159,10 +168,22 @@ class Soma:
         self._conn.execute("PRAGMA foreign_keys=OFF")
 
     def _load_json_graph(self, path: Path) -> None:
-        """Load the legacy JSON graph shape into the SQLite connection."""
+        """Load the legacy JSON graph shape into the SQLite connection.
+
+        An empty file is not a malformed graph; it is a store that has not
+        been written yet. Treating it as corrupt made every fresh temp-path
+        store raise on construction, which is exactly how a new store is
+        created.
+        """
         try:
-            data = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
+            text = path.read_text()
+        except OSError as exc:
+            raise ValueError(f"Cannot read SOMA graph {path}: {exc}") from exc
+        if not text.strip():
+            return
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
             raise ValueError(f"Cannot read SOMA graph {path}: {exc}") from exc
 
         for nid, ndata in (data.get("nodes") or {}).items():
@@ -176,16 +197,24 @@ class Soma:
             self._insert_node_row(nid, node_type, props)
 
         for edata in data.get("edges") or []:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO edges (edge_id, source, rel_type, target) "
-                "VALUES (?,?,?,?)",
-                (
-                    edata.get("id") or str(uuid.uuid4())[:8],
-                    edata.get("source", ""),
-                    edata.get("rel_type", ""),
-                    edata.get("target", ""),
-                ),
+            rel = edata.get("rel_type", "")
+            params = (
+                edata.get("id") or str(uuid.uuid4())[:8],
+                edata.get("source", ""),
+                rel,
+                edata.get("target", ""),
             )
+            sql = ("INSERT OR REPLACE INTO edges "
+                   "(edge_id, source, rel_type, target) VALUES (?,?,?,?)")
+            # Loading a graph that was written by a newer schema must widen
+            # the CHECK list, exactly as create_edge does, or the store cannot
+            # reopen a file it produced itself.
+            try:
+                self.conn.execute(sql, params)
+            except sqlite3.IntegrityError:
+                if not self._widen_rel_type_check(rel):
+                    raise
+                self.conn.execute(sql, params)
         self.conn.commit()
 
     # ── CRUD (same signatures as old store.py) ───────────────────────────
@@ -221,10 +250,18 @@ class Soma:
 
     def create_edge(self, source: str, rel_type: str, target: str) -> str:
         eid = str(uuid.uuid4())[:8]
-        self.conn.execute(
-            "INSERT INTO edges (edge_id, source, rel_type, target) VALUES (?,?,?,?)",
-            (eid, source, rel_type, target),
-        )
+        try:
+            self.conn.execute(
+                "INSERT INTO edges (edge_id, source, rel_type, target) VALUES (?,?,?,?)",
+                (eid, source, rel_type, target),
+            )
+        except sqlite3.IntegrityError:
+            if not self._widen_rel_type_check(rel_type):
+                raise
+            self.conn.execute(
+                "INSERT INTO edges (edge_id, source, rel_type, target) VALUES (?,?,?,?)",
+                (eid, source, rel_type, target),
+            )
         self.conn.commit()
         self._batch_dirty = True
         if not self._batch_mode:
@@ -605,6 +642,63 @@ class Soma:
             self.conn.execute(new_sql)
             self.conn.execute(
                 f"INSERT INTO nodes ({column_list}) "
+                f"SELECT {column_list} FROM {backup}")
+            self.conn.execute(f"DROP TABLE {backup}")
+            for index in indexes:
+                self.conn.execute(index["sql"])
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return True
+
+    def _widen_rel_type_check(self, rel_type: str) -> bool:
+        """Add ``rel_type`` to the edges table's allowed relationship types.
+
+        The schema enumerates permitted edge kinds, so an edge type introduced
+        after a store was created cannot be inserted. The table is rebuilt with
+        its rows and indexes preserved plus the new type, exactly as
+        ``_widen_node_type_check`` does for nodes. Returns ``True`` when the
+        table was rebuilt so the caller can retry the insert.
+        """
+        row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='edges'"
+        ).fetchone()
+        if row is None or not row["sql"]:
+            return False
+        create_sql = row["sql"]
+        match = _REL_TYPE_CHECK_RE.search(create_sql)
+        if match is None:
+            return False
+        allowed = re.findall(r"'([^']*)'", match.group("types"))
+        if rel_type in allowed or not rel_type or "'" in rel_type:
+            return False
+
+        widened = ", ".join(f"'{t}'" for t in [*allowed, rel_type])
+        new_sql = (create_sql[:match.start("types")] + widened
+                   + create_sql[match.end("types"):])
+
+        indexes = self.conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='index' "
+            "AND tbl_name='edges' AND sql IS NOT NULL"
+        ).fetchall()
+        columns = [c["name"] for c in self.conn.execute(
+            "PRAGMA table_info(edges)").fetchall()]
+        if not columns:
+            return False
+        column_list = ", ".join(f'"{c}"' for c in columns)
+        backup = "_edges_schema_backup"
+
+        self.conn.commit()
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            self.conn.execute(f"DROP TABLE IF EXISTS {backup}")
+            self.conn.execute(
+                f"CREATE TABLE {backup} AS SELECT * FROM edges")
+            self.conn.execute("DROP TABLE edges")
+            self.conn.execute(new_sql)
+            self.conn.execute(
+                f"INSERT INTO edges ({column_list}) "
                 f"SELECT {column_list} FROM {backup}")
             self.conn.execute(f"DROP TABLE {backup}")
             for index in indexes:
