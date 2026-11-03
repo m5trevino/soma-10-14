@@ -265,8 +265,7 @@ class EngineClient:
                    expected_hash: str | None = None,
                    temperature: float | None = None,
                    soma: Any = None,
-                   raw_chat_set: list[dict] | None = None,
-                   run_id: str | None = None) -> Any:
+                   raw_chat_set: list[dict] | None = None) -> Any:
         """Call one stage and verify its output before it is trusted.
 
         Instructions come from the ``stage_instructions`` row for this stage,
@@ -282,11 +281,11 @@ class EngineClient:
         from .gate import validate, is_done, is_hard_block
         from .provenance import (verify_distiller, verify_introbeaver)
 
-        # PEA files are filed under a pipeline run, not the chat-log session.
-        # Keying only on session_id meant every run of the same session wrote
-        # into one directory: 5,042 files interleaved, with no way to tell
-        # which run produced which call.
-        pea_session = f"{run_id}--{session_id}" if run_id else session_id
+        # The engine names the PEA directory itself: start time plus this
+        # session id. Sending a composite tag here would only be prefixed
+        # again on the other side, so the session id is sent as-is and the
+        # server owns the naming.
+        pea_session = session_id
 
         instruction = None
         if soma is not None:

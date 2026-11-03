@@ -249,15 +249,8 @@ class Engine:
         if self._debug_dir:
             self._debug_dir.mkdir(parents=True, exist_ok=True)
         # One identifier for this pipeline run. Every PEA file this run
-        # produces is filed under it, so a session directory holds one run's
-        # calls instead of every run that ever touched the same chat log.
-        #
-        # Two runs must never share a directory. A second is too coarse: two
-        # runs started in the same second would collide, and the engine
-        # appends to whatever directory already exists. The microsecond
-        # suffix keeps the name unique without asking the filesystem.
-        self.run_id = (time.strftime("%Y%m%d-%H%M%S")
-                       + f"-{time.time_ns() % 1_000_000:06d}")
+        # PEA directories are named by the engine (start time + session id).
+        # Nothing here needs to track a run id, so none is kept.
         self._manifest_lock = threading.Lock()
 
         # Soma graph store (per-session by default)
@@ -541,7 +534,6 @@ class Engine:
                     expected_hash=cs.chatset_hash if stage in
                     ("distiller", "introbeaver") else None,
                     soma=self._soma, raw_chat_set=cs.raw_chat_set,
-                    run_id=self.run_id,
                 )
             except BaseException:
                 timer.finish("CRASHED")

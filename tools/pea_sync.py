@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
-"""Pull PEA session files from the engine into a local, ordered archive.
+"""Mirror PEA session files from the engine to this machine.
 
 Every model call writes one PEA file on the engine containing the verbatim
-request and response. This pulls them down and renames each one so a plain
-`ls` puts them in the order they happened, with the stage and outcome visible
-in the name.
+request and response. The engine names both the directory and the file:
 
-Local layout:
+    ~/pea-sessions/<MM-DD-YY-HHMMAM/PM>-<session>/
+        <MM-DD-YY-HHMMAM/PM>-<stage>-SUCCESS.txt
+        <MM-DD-YY-HHMMAM/PM>-<stage>-FAIL.txt
 
-    ~/pea-sessions/<session>/<YYYYMMDD-HHMMSS>-<NN>-<stage>-<OK|FAIL>.txt
-
-The sequence number is the file's chronological position inside that session,
-so ordering survives two calls landing in the same second.
-
-The stage comes from the PEA body itself ("MACHINE TALK — TB-001: DISTILLER"),
-not from the engine's metadata, so it works for files written before stage
-labelling existed.
+One directory per pipeline session, created when that session's first PEA is
+written. This tool copies the tree down unchanged. It does not rename
+anything: the server owns the naming, and a second naming scheme on this side
+is what produced two competing conventions before.
 
 Usage:
-    python3 tools/pea_sync.py                 # sync everything, once
-    python3 tools/pea_sync.py --watch         # keep syncing
+    python3 tools/pea_sync.py                 # pull new files, once
+    python3 tools/pea_sync.py --watch         # keep pulling
     python3 tools/pea_sync.py --session NAME  # one session only
+    python3 tools/pea_sync.py --status        # what is on disk, newest first
     python3 tools/pea_sync.py --dest DIR
 """
 from __future__ import annotations
@@ -213,82 +210,32 @@ def group_runs(paths: list[Path]) -> list[list[Path]]:
 
 
 def sync_once(dest: Path, only: str | None = None) -> None:
+    """Mirror new PEA files down, one local directory per remote directory.
+
+    The engine names both the directory (start time + session id) and each
+    file (start time + stage + SUCCESS|FAIL). Nothing is renamed here: the
+    server is the single authority for naming, and re-deriving names on this
+    side is what produced two competing conventions in the first place.
+
+    Only remote directories that appeared since the last pass are pulled, so
+    history already on the server is never re-fetched.
+    """
     sessions = [only] if only else _list_sessions()
     if not sessions:
         print("  no sessions found on the engine", file=sys.stderr)
         return
 
     for session in sessions:
-        run_id, chat_session = _split_run(session)
-        # Group by run first, then by chat session inside the run. A run
-        # directory answers "what did this pipeline run do"; a session
-        # directory alone answers nothing, because every run wrote into it.
-        if run_id:
-            # Newer engine: the remote directory name already identifies one
-            # run. File it flat, "<run>--<session>", so every run directory
-            # sits at the same level whether it was named by the engine or
-            # reconstructed from timestamps.
-            target = dest / f"{run_id}--{chat_session}"
-            before = set(p.name for p in target.glob("*.txt")) if target.is_dir() else set()
-            if not _rsync(f"{session}/", target):
-                continue
-            after = set(p.name for p in target.glob("*.txt"))
-            new = len(after - before)
-            moved = organise_dir(target)
-            label = f"{run_id}/{chat_session}"
-            if new or moved:
-                print(f"  {label}: {new} new, {moved} renamed")
+        target = dest / session
+        before = {p.name for p in target.glob("*.txt")} if target.is_dir() else set()
+        if not _rsync(f"{session}/", target):
             continue
-
-        # Older engine: the remote directory holds every run of this session.
-        # Stage into a holding area, then split by time gap into run dirs.
-        #
-        # The holding area is emptied every pass, so "new" cannot be measured
-        # from it. Filed files are also renamed into chronological order, so
-        # their names no longer match the remote ones. Each run directory
-        # therefore records the remote names it consumed in .sources, and a
-        # pass counts only files whose remote name appears in none of them.
-        # Without that index every pass re-pulls and re-files the whole
-        # session forever.
-        holding = dest / ".incoming" / chat_session
-        if not _rsync(f"{session}/", holding):
-            continue
-
-        already: set[str] = set()
-        for d in dest.iterdir():
-            if not d.is_dir() or not d.name.endswith(f"--{chat_session}"):
-                continue
-            idx = d / ".sources"
-            if idx.is_file():
-                already.update(idx.read_text().split())
-        incoming = sorted(holding.glob("*.txt"))
-        fresh = [p for p in incoming if p.name not in already]
-        new = len(fresh)
-
-        runs = group_runs(incoming)
-        filed = 0
-        for run in runs:
-            first = min(_file_epoch(p) or 0.0 for p in run)
-            tag = _datetime.datetime.fromtimestamp(first).strftime("%Y%m%d-%H%M%S")
-            run_dir = dest / f"{tag}--{chat_session}"
-            run_dir.mkdir(parents=True, exist_ok=True)
-            # Record the remote names this run consumed before renaming them.
-            idx = run_dir / ".sources"
-            seen = set(idx.read_text().split()) if idx.is_file() else set()
-            seen.update(p.name for p in run)
-            idx.write_text("\n".join(sorted(seen)) + "\n")
-            for f in run:
-                run_dir.joinpath(f.name).unlink(missing_ok=True)
-                f.rename(run_dir / f.name)
-            organise_dir(run_dir)
-            filed += len(run)
-        try:
-            holding.rmdir()
-        except OSError:
-            pass
-        if new or filed:
-            print(f"  {chat_session}: {new} new, {len(runs)} run(s), "
-                  f"{filed} filed")
+        after = {p.name for p in target.glob("*.txt")}
+        new = sorted(after - before)
+        if new:
+            print(f"  {session}: {len(new)} new")
+            for name in new:
+                print(f"    {name}")
 
 
 def _colour_enabled() -> bool:
