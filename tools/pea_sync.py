@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import sys
+import datetime as _datetime
 import time
 from pathlib import Path
 
@@ -107,8 +108,12 @@ def _stamp_and_status(text: str, fallback: Path) -> tuple[str, str]:
 
 
 def organise(session: str, dest: Path) -> int:
-    """Rename this session's downloaded files into chronological order."""
-    raw = dest / session
+    """Rename one session directory's files into chronological order."""
+    return organise_dir(dest / session)
+
+
+def organise_dir(raw: Path) -> int:
+    """Rename a directory's PEA files into chronological order."""
     if not raw.is_dir():
         return 0
 
@@ -139,6 +144,66 @@ def organise(session: str, dest: Path) -> int:
     return renamed
 
 
+def _split_run(name: str) -> tuple[str, str]:
+    """Split an engine PEA directory name into (run_id, session).
+
+    A newer engine names a run "<YYYYMMDD-HHMMSS>--<session>". An older one
+    names only the session, so the run has to be recovered per file from the
+    timestamp inside it. Directories without a separator are returned with an
+    empty run id and filed by `_run_of_file`.
+    """
+    if "--" in name:
+        run_id, _, session = name.partition("--")
+        return run_id, session
+    return "", name
+
+
+# Two files this far apart cannot belong to the same pipeline run. A run is a
+# single invocation over a queue; ten minutes of silence inside one means the
+# operator started another.
+RUN_GAP = 600.0
+
+
+def _file_epoch(path: Path) -> float | None:
+    """Epoch seconds for a PEA file, from its content stamp or its mtime."""
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return None
+    stamp, _ = _stamp_and_status(text, path)
+    try:
+        return _datetime.datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()
+    except (ValueError, TypeError):
+        pass
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def group_runs(paths: list[Path]) -> list[list[Path]]:
+    """Split one session's files into pipeline runs by time gaps.
+
+    The engine files by chat-log session, so a session directory holds every
+    run that ever touched that log. Recovering runs from the files
+    themselves is the only option when the remote naming is old.
+    """
+    stamped = [(t, p) for p in paths for t in [_file_epoch(p)] if t is not None]
+    stamped.sort(key=lambda x: (x[0], x[1].name))
+    runs: list[list[Path]] = []
+    cur: list[Path] = []
+    prev: float | None = None
+    for t, path in stamped:
+        if prev is not None and t - prev > RUN_GAP and cur:
+            runs.append(cur)
+            cur = []
+        cur.append(path)
+        prev = t
+    if cur:
+        runs.append(cur)
+    return runs
+
+
 def sync_once(dest: Path, only: str | None = None) -> None:
     sessions = [only] if only else _list_sessions()
     if not sessions:
@@ -146,14 +211,50 @@ def sync_once(dest: Path, only: str | None = None) -> None:
         return
 
     for session in sessions:
-        before = set(p.name for p in (dest / session).glob("*.txt")) if (dest / session).is_dir() else set()
-        if not _rsync(f"{session}/", dest / session):
+        run_id, chat_session = _split_run(session)
+        # Group by run first, then by chat session inside the run. A run
+        # directory answers "what did this pipeline run do"; a session
+        # directory alone answers nothing, because every run wrote into it.
+        if run_id:
+            target = dest / run_id / chat_session
+            before = set(p.name for p in target.glob("*.txt")) if target.is_dir() else set()
+            if not _rsync(f"{session}/", target):
+                continue
+            after = set(p.name for p in target.glob("*.txt"))
+            new = len(after - before)
+            moved = organise_dir(target)
+            label = f"{run_id}/{chat_session}"
+            if new or moved:
+                print(f"  {label}: {new} new, {moved} renamed")
             continue
-        after = set(p.name for p in (dest / session).glob("*.txt"))
-        new = len(after - before)
-        moved = organise(session, dest)
-        if new or moved:
-            print(f"  {session}: {new} new, {moved} renamed")
+
+        # Older engine: the remote directory holds every run of this session.
+        # Stage into a holding area, then split by time gap into run dirs.
+        holding = dest / ".incoming" / chat_session
+        before = set(p.name for p in holding.glob("*.txt")) if holding.is_dir() else set()
+        if not _rsync(f"{session}/", holding):
+            continue
+        new = len(set(p.name for p in holding.glob("*.txt")) - before)
+
+        runs = group_runs(sorted(holding.glob("*.txt")))
+        filed = 0
+        for run in runs:
+            first = min(_file_epoch(p) or 0.0 for p in run)
+            tag = _datetime.datetime.fromtimestamp(first).strftime("%Y%m%d-%H%M%S")
+            run_dir = dest / f"{tag}--{chat_session}"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            for f in run:
+                run_dir.joinpath(f.name).unlink(missing_ok=True)
+                f.rename(run_dir / f.name)
+            organise_dir(run_dir)
+            filed += len(run)
+        try:
+            holding.rmdir()
+        except OSError:
+            pass
+        if new or filed:
+            print(f"  {chat_session}: {new} new, {len(runs)} run(s), "
+                  f"{filed} filed")
 
 
 def main() -> int:

@@ -248,6 +248,10 @@ class Engine:
         self._debug_dir = Path(debug_dir) if debug_dir else None
         if self._debug_dir:
             self._debug_dir.mkdir(parents=True, exist_ok=True)
+        # One identifier for this pipeline run. Every PEA file this run
+        # produces is filed under it, so a session directory holds one run's
+        # calls instead of every run that ever touched the same chat log.
+        self.run_id = time.strftime("%Y%m%d-%H%M%S")
         self._manifest_lock = threading.Lock()
 
         # Soma graph store (per-session by default)
@@ -531,6 +535,7 @@ class Engine:
                     expected_hash=cs.chatset_hash if stage in
                     ("distiller", "introbeaver") else None,
                     soma=self._soma, raw_chat_set=cs.raw_chat_set,
+                    run_id=self.run_id,
                 )
             except BaseException:
                 timer.finish("CRASHED")
