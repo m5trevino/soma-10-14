@@ -273,7 +273,7 @@ SPECS: list[Spec] = [
         short="9893",
         hint="read or download one, or all",
         cwd=SOMA_DIR,
-        command="python3 tools/pea_manifest_view.py",
+        command="python3 tools/pea_viewer.py",
         probe=lambda: port_open(PEA_MANIFEST_PORT),
         url=lambda: f"http://127.0.0.1:{PEA_MANIFEST_PORT}",
     ),

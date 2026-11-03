@@ -190,13 +190,31 @@
   text-shadow: 0 0 9px var(--green-glow);
 }
 
+/* Chat sets sit immediately left of the score and carry more weight, since
+   a session's exchange count says more about its substance than the raw
+   dev score does. */
 .col-sets {
-  width: 62px;
+  width: 78px;
   text-align: right;
-  font-weight: 700;
+  font-weight: 800;
   font-variant-numeric: tabular-nums;
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
   color: var(--amber);
   text-shadow: 0 0 8px var(--amber-glow);
+  white-space: nowrap;
+}
+
+.col-sets .sets-value {
+  font-size: 13px;
+  letter-spacing: 0.02em;
+}
+
+.col-sets .sets-unit {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: rgba(255, 191, 90, 0.55);
+  margin-left: 3px;
 }
 
 .col-chars {

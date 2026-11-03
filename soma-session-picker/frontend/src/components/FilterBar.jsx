@@ -6,12 +6,13 @@ function FilterBar(props) {
     domain, setDomain,
     provider, setProvider,
     model, setModel,
+    project, setProject,
     minScore, setMinScore,
     sort, setSort,
     order, setOrder,
     limit, setLimit,
     minSets, setMinSets,
-    providers, domains, models,
+    providers, domains, models, projects,
     scoreRange, filterOptionsLoaded,
     onRefresh,
   } = props
@@ -23,6 +24,21 @@ function FilterBar(props) {
   return (
     <div className="filter-bar">
       <div className="filter-row">
+        {/* Project — primary axis for dev work */}
+        {filterOptionsLoaded && projects.length > 0 && (
+          <div className="filter-group filter-group-project">
+            <label>Project</label>
+            <select value={project} onChange={(e) => setProject(e.target.value)}>
+              <option value="">All projects</option>
+              {projects.map((p) => (
+                <option key={p.project_key} value={p.project_key}>
+                  {p.project_name} ({p.session_count})
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+
         {/* Search */}
         <div className="filter-group filter-group-search">
           <label>Search</label>
@@ -83,17 +99,17 @@ function FilterBar(props) {
           </select>
         </div>
 
-        {/* Min Sets */}
+        {/* Min Sets — logical exchanges (user message + reply), not files */}
         <div className="filter-group">
           <label>Min Sets</label>
           <select value={minSets} onChange={(e) => setMinSets(Number(e.target.value))}>
             <option value={0}>All</option>
+            <option value={5}>5+</option>
             <option value={10}>10+</option>
+            <option value={25}>25+</option>
             <option value={50}>50+</option>
             <option value={100}>100+</option>
             <option value={200}>200+</option>
-            <option value={500}>500+</option>
-            <option value={1000}>1000+</option>
           </select>
         </div>
 
@@ -101,12 +117,12 @@ function FilterBar(props) {
         <div className="filter-group">
           <label>Sort</label>
           <select value={sort} onChange={(e) => setSort(e.target.value)}>
-            <option value="score">Score</option>
             <option value="sets">Sets</option>
+            <option value="score">Score</option>
+            <option value="date">Date</option>
             <option value="name">Name</option>
             <option value="provider">Provider</option>
             <option value="domain">Domain</option>
-            <option value="date">Date</option>
             <option value="functions">Functions</option>
           </select>
         </div>
@@ -129,7 +145,6 @@ function FilterBar(props) {
             ))}
           </select>
         </div>
-
         {/* Refresh */}
         <div className="filter-group filter-group-btn">
           <label>&nbsp;</label>

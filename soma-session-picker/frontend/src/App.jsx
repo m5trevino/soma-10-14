@@ -23,6 +23,9 @@ function topLabel(value) {
 
 function App() {
   const [sessions, setSessions] = useState([])
+  const [groups, setGroups] = useState([])
+  // "flat" = one row per session; "grouped" = one collapsible node per project.
+  const [viewMode, setViewMode] = useState('grouped')
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
   const [selected, setSelected] = useState(new Set())
@@ -67,16 +70,23 @@ function App() {
   const [domain, setDomain] = useState('')
   const [provider, setProvider] = useState('')
   const [model, setModel] = useState('')
+  const [project, setProject] = useState('')
   const [minScore, setMinScore] = useState(0)
-  const [sort, setSort] = useState('score')
+  // Chat set count is the more informative axis for judging a session's
+  // substance, so it leads by default.
+  const [sort, setSort] = useState('sets')
   const [order, setOrder] = useState('desc')
-  const [limit, setLimit] = useState(500)
+  // The vault holds ~4,800 sessions. A 500-row ceiling silently cut the list
+  // off partway down (at 53 chat sets in score order), so the default fetches
+  // everything and the Limit control is an explicit narrowing tool.
+  const [limit, setLimit] = useState(5000)
   const [minSets, setMinSets] = useState(0)
 
   // Filter options
   const [providers, setProviders] = useState([])
   const [domains, setDomains] = useState([])
   const [models, setModels] = useState([])
+  const [projects, setProjects] = useState([])
   const [scoreRange, setScoreRange] = useState({ min: 0, max: 0 })
   const [filterOptionsLoaded, setFilterOptionsLoaded] = useState(false)
 
@@ -97,6 +107,13 @@ function App() {
         setFilterOptionsLoaded(true)
       })
       .catch(() => setFilterOptionsLoaded(true))
+
+    // Projects are ranked by session count; only list ones with real volume
+    // so the dropdown stays navigable.
+    fetch(`${API}/projects?min_sessions=2&limit=300`)
+      .then((r) => r.json())
+      .then((d) => setProjects(d.projects || []))
+      .catch(() => setProjects([]))
   }, [])
 
   // Fetch current TurnKey profile
@@ -126,22 +143,30 @@ function App() {
         domain: domain || '',
         provider: provider || '',
         model: model || '',
+        project: project || '',
         min_score: String(minScore),
         sort: sort,
         order: order,
-        limit: String(limit),
+        limit: '5000',
         min_sets: String(minSets),
       })
-      const res = await fetch(`${API}/sessions?${params}`)
+      // Fetch both shapes in parallel: the flat list for the table, and the
+      // grouped tree so repeats of one project collapse under a single node.
+      const [res, gres] = await Promise.all([
+        fetch(`${API}/sessions?${params}`),
+        fetch(`${API}/sessions/grouped?${params}`),
+      ])
       const data = await res.json()
+      const gdata = await gres.json().catch(() => ({ groups: [] }))
       setSessions(data.sessions || [])
       setTotal(data.total || 0)
+      setGroups(gdata.groups || [])
     } catch (err) {
       console.error('Failed to fetch sessions:', err)
     } finally {
       setLoading(false)
     }
-  }, [search, domain, provider, model, minScore, sort, order, limit, minSets])
+  }, [search, domain, provider, model, project, minScore, sort, order, limit, minSets])
 
   useEffect(() => {
     fetchSessions()
@@ -208,7 +233,37 @@ function App() {
       next.delete(sessionId)
       return next
     })
+    setExportSelected((prev) => {
+      const next = new Set(prev)
+      next.delete(sessionId)
+      return next
+    })
   }, [])
+
+  // Favorites — clear every favorite, and the export selection with it.
+  // Without this the list is permanent: favorites live in localStorage and
+  // the only per-row control was a single ✕.
+  const clearFavorites = useCallback(() => {
+    const n = favorites.size
+    if (n === 0) return
+    if (!window.confirm(`Clear all ${n} favorites? This cannot be undone.`)) return
+    setFavorites(new Set())
+    setExportSelected(new Set())
+    setExportStatus(`Cleared ${n} favorites`)
+  }, [favorites.size])
+
+  // Favorites — remove just the ones checked for export
+  const removeSelectedFavorites = useCallback(() => {
+    const ids = new Set(exportSelected)
+    if (ids.size === 0) return
+    setFavorites((prev) => {
+      const next = new Set(prev)
+      ids.forEach((id) => next.delete(id))
+      return next
+    })
+    setExportSelected(new Set())
+    setExportStatus(`Removed ${ids.size} favorites`)
+  }, [exportSelected])
 
   // Toggle favorite star on a session row
   const toggleFavorite = useCallback((sessionId) => {
@@ -243,6 +298,13 @@ function App() {
     await Promise.all(promises)
     setAllFavorites(favList)
   }, [favorites])
+
+  // Total chat sets across every favorite, so the panel header shows how much
+  // conversation the current selection represents.
+  const favTotalSets = useMemo(
+    () => allFavorites.reduce((sum, f) => sum + (f.total_sets || 0), 0),
+    [allFavorites]
+  )
 
   // Load sessions from a JSON file
   const loadSessions = useCallback(async () => {
@@ -331,30 +393,52 @@ function App() {
     }
     setExporting(true)
     setExportStatus('Loading favorites metadata...')
-    
+
+    // Favorites are stored as session_ids, but the metadata blob is keyed by
+    // directory name (_session_id). Comparing the two directly silently
+    // produced an empty export whenever anything was checked, so both forms
+    // are collected and matched.
+    const dirOf = (sid) => (sid || '').split('/').pop()
+    const wantedIds = exportSelected.size > 0 ? Array.from(exportSelected) : Array.from(favorites)
+    const wantedDirs = new Set(wantedIds.map(dirOf).filter(Boolean))
+
     const favoritesList = []
     for (const fav of allFavorites) {
-      if (!fav.error) {
-        const sid = fav.session_id || fav._session_id
-        // Only include favorites that are checked for export
-        if (exportSelected.size === 0 || exportSelected.has(sid)) {
-          favoritesList.push({
-            session_id: fav.session_id,
-            provider: fav.provider || fav._session_id?.split('/')?.pop() || '',
-            total_sets: fav.total_sets || 0,
-            total_session_chars: fav.total_session_chars || 0,
-            file_count: fav.file_count || 0,
-            anchors: fav.anchors || [],
-            tool_calls: fav.tool_calls || [],
-            metadata: fav.metadata || {},
-            json_file_list: fav.json_file_list || [],
-          })
-        }
-      }
+      if (fav.error) continue
+      const sid = fav.session_id || fav._session_id
+
+      // Favorites hold full session_ids ("acct/session.dir") while the
+      // metadata blob is keyed by directory name ("session.dir"). Matching
+      // only on directory keeps the two aligned in both modes.
+      const include =
+        exportSelected.size === 0
+          ? wantedDirs.has(dirOf(sid)) || wantedDirs.has(dirOf(fav._session_id))
+          : exportSelected.has(sid) ||
+            exportSelected.has(fav._session_id) ||
+            wantedDirs.has(dirOf(sid)) ||
+            wantedDirs.has(dirOf(fav._session_id))
+
+      if (!include) continue
+
+      favoritesList.push({
+        session_id: sid,
+        provider: fav.provider || '',
+        total_sets: fav.total_sets || 0,
+        total_session_chars: fav.total_session_chars || 0,
+        file_count: fav.file_count || 0,
+        anchors: fav.anchors || [],
+        tool_calls: fav.tool_calls || [],
+        metadata: fav.metadata || {},
+        json_file_list: fav.json_file_list || [],
+      })
     }
 
-    // Write queue file with only selected session IDs
-    const selectedIds = Array.from(exportSelected) || Array.from(favorites)
+    // Queue file carries only the exported session IDs.
+    //
+    // The previous form, `Array.from(exportSelected) || Array.from(favorites)`,
+    // never fell back: an empty array is truthy in JavaScript, so exporting
+    // with nothing checked wrote an empty queue.
+    const selectedIds = wantedIds
     const queueData = {
       selected: selectedIds,
       count: selectedIds.length,
@@ -370,18 +454,22 @@ function App() {
       console.error('Failed to update queue:', e)
     }
 
-    // Download metadata JSON
+    // Download metadata JSON. The filename carries the time as well as the
+    // date so a second export on the same day does not overwrite the first.
     const metadataBlob = new Blob(
       [JSON.stringify(favoritesList, null, 2)],
       { type: 'application/json' }
     )
     const metaUrl = URL.createObjectURL(metadataBlob)
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
     const a = document.createElement('a')
     a.href = metaUrl
-    a.download = `soma_favorites_${new Date().toISOString().slice(0, 10)}.json`
+    a.download = `soma_favorites_${stamp}.json`
     a.click()
     URL.revokeObjectURL(metaUrl)
-    setExportStatus(`✓ Exported ${favoritesList.length} favorites to JSON`)
+    setExportStatus(
+      `✓ Exported ${favoritesList.length} of ${favorites.size} favorites`
+    )
     setExporting(false)
   }, [favorites, allFavorites, exportSelected])
 
@@ -405,12 +493,13 @@ function App() {
     domain, setDomain,
     provider, setProvider,
     model, setModel,
+    project, setProject,
     minScore, setMinScore,
     sort, setSort,
     order, setOrder,
     limit, setLimit,
     minSets, setMinSets,
-    providers, domains, models,
+    providers, domains, models, projects,
     scoreRange, filterOptionsLoaded,
     onRefresh: fetchSessions,
   }
@@ -453,7 +542,20 @@ function App() {
               onClick={exportFavorites}
               disabled={exporting || favorites.size === 0}
             >
-              {exporting ? 'Exporting...' : `Export ${favorites.size} Favorites`}
+              {exporting
+                ? 'Exporting...'
+                : exportSelected.size > 0
+                  ? `Export ${exportSelected.size} Selected Favs`
+                  : `Export ${favorites.size} Favorites`}
+            </button>
+          )}
+          {favorites.size > 0 && (
+            <button
+              className="btn-clear-fav"
+              onClick={clearFavorites}
+              title="Clear all favorites"
+            >
+              Clear Favs
             </button>
           )}
         </div>
@@ -646,10 +748,37 @@ function App() {
 
       <FilterBar {...filterBarProps} />
 
+      <div className="view-bar">
+        <div className="rocker" role="tablist">
+          <div className="rocker-slot">
+            <div className={`rocker-knob${viewMode === 'files' ? ' right' : ''}`}></div>
+            <button
+              className={viewMode === 'grouped' ? 'on' : ''}
+              onClick={() => setViewMode('grouped')}
+            >
+              By project
+            </button>
+            <button
+              className={viewMode === 'flat' ? 'on' : ''}
+              onClick={() => setViewMode('flat')}
+            >
+              All sessions
+            </button>
+          </div>
+        </div>
+        <span className="view-hint">
+          {viewMode === 'grouped'
+            ? `${groups.length} projects · ${groups.reduce((n, g) => n + g.session_count, 0)} sessions`
+            : `${sessions.length} of ${total} sessions`}
+        </span>
+      </div>
+
       <div className="main-layout">
         <main className="main">
           <SessionTable
             sessions={displayedSessions}
+            groups={groups}
+            grouped={viewMode === 'grouped'}
             selected={selected}
             favorites={favorites}
             loading={loading}
@@ -666,6 +795,14 @@ function App() {
           <aside className="favorites-panel">
             <div className="favorites-panel-header">
               <span>Favorites ({allFavorites.length})</span>
+              {favTotalSets > 0 && (
+                <span
+                  className="fav-header-sets"
+                  title="Total chat sets across all favorites (one user message + one agent reply each)"
+                >
+                  {favTotalSets.toLocaleString()} sets
+                </span>
+              )}
               <button className="favorites-panel-close" onClick={() => setShowFavoritesPanel(false)} title="Close panel">✕</button>
             </div>
             {allFavorites.length > 0 && (
@@ -677,10 +814,26 @@ function App() {
                   {exportSelected.size === allFavorites.length ? 'Select None' : 'Select All'}
                 </button>
                 {exportSelected.size > 0 && (
-                  <span className="fav-selected-count">
-                    {exportSelected.size} selected for export
-                  </span>
+                  <>
+                    <span className="fav-selected-count">
+                      {exportSelected.size} selected for export
+                    </span>
+                    <button
+                      className="btn-remove-selected"
+                      onClick={removeSelectedFavorites}
+                      title={`Remove these ${exportSelected.size} from favorites`}
+                    >
+                      Remove {exportSelected.size}
+                    </button>
+                  </>
                 )}
+                <button
+                  className="btn-clear-favorites"
+                  onClick={clearFavorites}
+                  title="Clear every favorite"
+                >
+                  Clear All
+                </button>
               </div>
             )}
             <div className="favorites-panel-body">
@@ -702,6 +855,13 @@ function App() {
                           <span className="fav-item-id">{sid?.split('/').pop() || sid}</span>
                         </label>
                         <div className="fav-item-meta">
+                          {/* Chat sets: one user message + one agent reply. */}
+                          <span
+                            className={`fav-sets${(fav.total_sets || 0) === 0 ? ' fav-sets-zero' : ''}`}
+                            title={`${fav.total_sets || 0} chat sets — ${fav.file_count || 0} files on disk`}
+                          >
+                            {fav.total_sets || 0}
+                          </span>
                           {fav.metadata?.domain && <span className="fav-badge">{topLabel(fav.metadata.domain)}</span>}
                           {fav.metadata?.sentiment && <span className="fav-badge fav-sentiment">{topLabel(fav.metadata.sentiment)}</span>}
                         </div>

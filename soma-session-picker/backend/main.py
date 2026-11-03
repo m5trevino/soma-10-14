@@ -12,6 +12,7 @@ soma.machinetalk.session_metadata for lean, frequency-based data.
 import asyncio
 import json
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -76,6 +77,29 @@ def _import_session_metadata():
 async def lifespan(app: FastAPI):
     async with connection_context() as conn:
         await conn.execute("SELECT 1")
+
+        # The project filter depends on tables built by build_projects.py in
+        # the SearchMonkey backend. If they are missing, the dropdown renders
+        # empty and project= silently matches nothing, which looks like a bug
+        # in the UI. Report it once at startup instead.
+        try:
+            cursor = await conn.execute(
+                "SELECT COUNT(*) AS n FROM projects"
+            )
+            row = await cursor.fetchone()
+            if not row or not row["n"]:
+                print(
+                    "[session-picker] WARNING: project index is empty. "
+                    "Run build_projects.py to populate the Project filter.",
+                    flush=True,
+                )
+        except Exception:
+            print(
+                "[session-picker] WARNING: project index missing "
+                "(no 'projects' table). Run build_projects.py in the "
+                "SearchMonkey backend to enable the Project filter.",
+                flush=True,
+            )
     yield
 
 
@@ -154,7 +178,18 @@ def _build_full_session(sess: dict, meta: dict | None = None) -> dict:
         meta = _meta_cache.get(session_id.split("/")[-1])
     session_dir = Path(_resolve_path(session_id))
     session_json = _read_session_json(session_dir)
-    chatset_count = _count_chatsets(session_dir)
+    file_count = _count_chatsets(session_dir)
+
+    # A chat set is one user turn plus the assistant's reply. Sessions are
+    # stored as chat-set files, and a single exchange can be split across
+    # several files when it is long, so a file count is NOT a chat set count.
+    # session.json's total_sets already counts logical exchanges and is
+    # present for every session in the vault, so it is authoritative.
+    # dev_sessions.chat_set_count stores a file count and must not be used
+    # here; it inflated sessions by up to 6x (1756 files vs 303 exchanges).
+    logical_sets = session_json.get("total_sets")
+    if not isinstance(logical_sets, int) or logical_sets <= 0:
+        logical_sets = 0
 
     return {
         "session_id": session_id,
@@ -168,7 +203,11 @@ def _build_full_session(sess: dict, meta: dict | None = None) -> dict:
         "config_files": sess.get("config_files") or 0,
         "heredoc_code_files": sess.get("heredoc_code_files") or 0,
         "combined_text_length": sess.get("combined_text_length") or 0,
-        "chat_set_count": sess.get("chat_set_count") or chatset_count,
+        # Logical exchanges (user message + assistant reply).
+        "chat_set_count": logical_sets,
+        # Raw file count, kept separately so the two are never conflated.
+        "chat_file_count": file_count,
+        "chat_set_count_source": "session.json" if logical_sets else "missing",
         "provider": _normalize_provider(meta.get("provider")) if meta else "",
         "model": meta.get("model") if meta else "",
         "date": meta.get("date") if meta else "",
@@ -177,7 +216,7 @@ def _build_full_session(sess: dict, meta: dict | None = None) -> dict:
         "topics": meta.get("topics") if meta else "",
         "project_context": meta.get("project_context") if meta else "",
         "title": session_json.get("title") or session_json.get("name") or "",
-        "total_sets": session_json.get("total_sets") or chatset_count,
+        "total_sets": logical_sets,
         "total_session_chars": session_json.get("total_session_chars") or 0,
         "models_used": session_json.get("models_used") or {},
         "session_path": _resolve_path(session_id),
@@ -317,6 +356,56 @@ async def health():
     return {"status": "ok", "engine": "soma-session-picker"}
 
 
+@app.get("/api/projects")
+async def list_projects(
+    search: str = "",
+    min_sessions: int = 1,
+    sort: str = "sessions",
+    limit: int = 500,
+):
+    """List projects with their session counts.
+
+    Projects come from the ``projects`` table, built by build_projects.py from
+    two signals: the LLM-assigned ``project_context`` label and the destination
+    paths of heredocs written inside the session. Continuation chains (the same
+    session directory continued under another account after a context-limit
+    handoff) are counted once.
+
+    sort: sessions | score | heredocs | name | recent
+    """
+    sort_sql = {
+        "sessions": "session_count DESC, project_name ASC",
+        "score": "total_score DESC, project_name ASC",
+        "heredocs": "heredoc_hits DESC, project_name ASC",
+        "name": "project_name ASC",
+        "recent": "latest_date DESC, project_name ASC",
+    }.get(sort, "session_count DESC, project_name ASC")
+
+    sql = (
+        "SELECT project_key, project_name, session_count, heredoc_hits, "
+        "total_score, dev_session_count, earliest_date, latest_date "
+        "FROM projects WHERE session_count >= ?"
+    )
+    params: list = [min_sessions]
+
+    if search:
+        sql += " AND (lower(project_name) LIKE ? OR project_key LIKE ?)"
+        like = f"%{search.lower()}%"
+        params += [like, like]
+
+    sql += f" ORDER BY {sort_sql} LIMIT ?"
+    params.append(limit)
+
+    async with connection_context() as conn:
+        cursor = await conn.execute(sql, params)
+        rows = await cursor.fetchall()
+
+    return {
+        "projects": [dict(r) for r in rows],
+        "total": len(rows),
+    }
+
+
 @app.get("/api/profile")
 async def get_current_profile():
     """Return the TurnKey current profile (read-only)."""
@@ -353,22 +442,50 @@ async def get_sessions(
     domain: str = "",
     provider: str = "",
     model: str = "",
+    project: str = "",
     min_score: int = 0,
     max_score: int = 0,
     min_sets: int = 0,
-    sort: str = "score",
+    sort: str = "sets",
     order: str = "desc",
     limit: int = 500,
 ):
     """Return the full session list with search/filter/sort.
 
     NO metadata scanning — only DB fields + lightweight session.json reads.
+    When ``project`` is supplied, results are restricted to sessions linked to
+    that project key.
     """
     global _full_cache
     if _full_cache is None:
         await _build_full_cache()
 
     results = _full_cache[:]
+
+    # Filter: project.
+    #
+    # session_projects stores full session_ids while dev_sessions (and this
+    # cache) are keyed by directory name, so both forms are collected as
+    # match keys. This keeps continuation chains intact: every account row
+    # pointing at the same directory resolves to the same cached session.
+    if project:
+        linked: set[str] = set()
+        async with connection_context() as conn:
+            cursor = await conn.execute(
+                "SELECT session_id FROM session_projects WHERE project_key = ?",
+                (project,),
+            )
+            for r in await cursor.fetchall():
+                sid = r["session_id"]
+                linked.add(sid)
+                tail = (sid or "").split("/")[-1]
+                if tail:
+                    linked.add(tail)
+
+        results = [
+            s for s in results
+            if s["session_id"] in linked or s.get("session_dir_name") in linked
+        ]
 
     # Search
     if search:
@@ -426,11 +543,143 @@ async def get_sessions(
     else:
         results.sort(key=key_fn, reverse=reverse)
 
+    # `total` must describe the whole filtered set, not the page. Reporting
+    # the truncated length made the UI claim there were only 500 sessions and
+    # silently cut the list off mid-way (at 53 chat sets in score order).
+    total_matched = len(results)
     results = results[:limit]
     return {
         "sessions": results,
-        "total": len(results),
+        "total": total_matched,
+        "returned": len(results),
+        "has_more": len(results) < total_matched,
     }
+
+
+@app.get("/api/sessions/grouped")
+async def get_sessions_grouped(
+    search: str = "",
+    domain: str = "",
+    provider: str = "",
+    model: str = "",
+    project: str = "",
+    min_score: int = 0,
+    max_score: int = 0,
+    min_sets: int = 0,
+    sort: str = "sets",
+    order: str = "desc",
+    limit: int = 5000,
+):
+    """Sessions grouped under their project, so repeats collapse into one tree.
+
+    Sessions are keyed by directory name and one project owns many of them.
+    A flat list repeated the project label on every row and buried the
+    distinct projects. A session linked to several projects (e.g. the label
+    "peacock, social-lube") appears under each, so group counts add up.
+    """
+    global _full_cache
+    if _full_cache is None:
+        await _build_full_cache()
+
+    results = _full_cache[:]
+
+    if search:
+        q = search.lower()
+        results = [
+            s for s in results
+            if q in s["session_id"].lower()
+            or q in (s.get("title") or "").lower()
+            or q in (s.get("domain") or "").lower()
+            or q in (s.get("topics") or "").lower()
+            or q in (s.get("session_dir_name") or "").lower()
+            or q in (s.get("project_context") or "").lower()
+        ]
+    if domain:
+        results = [s for s in results if s.get("domain") == domain]
+    if provider:
+        norm = _normalize_provider(provider)
+        results = [s for s in results if _normalize_provider(s.get("provider") or "") == norm]
+    if model:
+        results = [s for s in results if s.get("model") == model]
+    if min_score > 0:
+        results = [s for s in results if s["total_score"] >= min_score]
+    if max_score > 0:
+        results = [s for s in results if s["total_score"] <= max_score]
+    if min_sets > 0:
+        results = [s for s in results if s["chat_set_count"] >= min_sets]
+
+    # directory name -> [(project_key, project_name), ...] from the index
+    links: dict[str, list[tuple[str, str]]] = {}
+    async with connection_context() as conn:
+        cursor = await conn.execute(
+            "SELECT session_id, project_key, project_name FROM session_projects"
+        )
+        for row in await cursor.fetchall():
+            sid = row["session_id"] or ""
+            tail = sid.split("/")[-1]
+            for key in {sid, tail}:
+                if key:
+                    links.setdefault(key, []).append(
+                        (row["project_key"], row["project_name"])
+                    )
+
+    def sort_key(s):
+        return {
+            "sets": s["chat_set_count"],
+            "score": s["total_score"],
+            "date": s.get("date") or "",
+            "name": s["session_dir_name"].lower(),
+        }.get(sort, s["chat_set_count"])
+
+    reverse = order == "desc"
+
+    tree: dict[str, dict] = {}
+    for s in results:
+        dir_name = s.get("session_dir_name") or s["session_id"].split("/")[-1]
+        pairs = links.get(dir_name) or links.get(s["session_id"]) or []
+        if not pairs:
+            label = (s.get("project_context") or "").strip() or "unassigned"
+            pairs = [(_norm_project(label), label or "unassigned")]
+
+        seen_keys: set[str] = set()
+        for key, name in pairs:
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            bucket = tree.setdefault(key, {
+                "project_key": key,
+                "project_name": name,
+                "sessions": [],
+                "total_sets": 0,
+                "total_score": 0,
+            })
+            bucket["sessions"].append(s)
+            bucket["total_sets"] += s["chat_set_count"]
+            bucket["total_score"] += s["total_score"]
+
+    groups = []
+    for key, bucket in tree.items():
+        if project and key != project:
+            continue
+        bucket["sessions"].sort(key=sort_key, reverse=reverse)
+        bucket["session_count"] = len(bucket["sessions"])
+        groups.append(bucket)
+
+    groups.sort(key=lambda g: g["total_sets"], reverse=True)
+
+    return {
+        "groups": groups,
+        "project_count": len(groups),
+        "total_sessions": sum(g["session_count"] for g in groups),
+    }
+
+
+def _norm_project(label: str) -> str:
+    """Same normalisation build_projects.py uses, kept local to avoid a cycle."""
+    s = (label or "").strip().lower()
+    s = re.sub(r"[_\-]+", " ", s)
+    s = re.sub(r"[^\w\s]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
 
 
 @app.get("/api/sessions/counts")
