@@ -735,13 +735,17 @@ class StageTimer:
     """
 
     def __init__(self, stage: str, session: str, chatset, chars: int,
-                 model: str = "") -> None:
+                 model: str = "", model_fn=None) -> None:
         self.stage = stage
         self.label = _stage_label(stage)
         self.session = session
         self.chatset = chatset
         self.chars = chars
         self.model = model or ""
+        # Optional callable returning the model the rotator would serve now.
+        # Retries advance the deck, so a name captured at start goes stale.
+        self.model_fn = model_fn
+        self.attempt = 1
         self._stop = threading.Event()
         self._thread: "threading.Thread | None" = None
         self._started = 0.0
@@ -779,10 +783,23 @@ class StageTimer:
         self._thread.start()
 
     def _line(self) -> str:
-        """Live bottom line, rendered fresh on every tick."""
+        """Live bottom line, rendered fresh on every tick.
+
+        The model is re-read each tick rather than captured at start. A retry
+        storm rotates the deck, so a frozen name shows one model "failing
+        repeatedly" while five cards are actually being burned in turn.
+        """
         elapsed = time.monotonic() - self._started
-        model = f" · {self.model}" if self.model else ""
-        return f"  … {self.label}{model} [⏳ {elapsed:.1f}s elapsed]"
+        model = self.model
+        if self.model_fn is not None:
+            try:
+                model = self.model_fn() or model
+            except Exception:
+                pass
+        tail = f" · {model}" if model else ""
+        tries = f"  {_C_DIM}(attempt {self.attempt}){_C_RESET}" if self.attempt > 1 else ""
+        return (f"  … {self.label}{tail} "
+                f"[⏳ {elapsed:.1f}s elapsed]{tries}")
 
     def _spin(self) -> None:
         """Keep the ticker alive when no step fill is running.

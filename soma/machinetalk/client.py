@@ -220,6 +220,10 @@ class EngineClient:
         last: Exception | None = None
         dns_failures = 0
         for attempt in range(attempts):
+            # Name the model this attempt will use. Without it a retry storm
+            # reads as one model failing repeatedly, when the deck is actually
+            # rotating behind it and every card is being burned in turn.
+            model = self.model_for(stage)
             try:
                 return self._tk.call(stage, messages, pea_session=pea_session,
                                      temperature=temperature)
@@ -231,7 +235,7 @@ class EngineClient:
                 last = exc
                 text = f"{type(exc).__name__}: {exc}"
                 print(f"\n[retry] {stage} attempt {attempt + 1}/{attempts} "
-                      f"failed: {text}", file=sys.stderr, flush=True)
+                      f"model={model} failed: {text}", file=sys.stderr, flush=True)
                 if any(tok in text for tok in self._UNRECOVERABLE):
                     dns_failures += 1
                     if dns_failures >= 2:
@@ -246,7 +250,7 @@ class EngineClient:
                 last = exc
                 text = f"{type(exc).__name__}: {exc}"
                 print(f"\n[retry] {stage} attempt {attempt + 1}/{attempts} "
-                      f"failed: {text}", file=sys.stderr, flush=True)
+                      f"model={model} failed: {text}", file=sys.stderr, flush=True)
                 if any(tok in text for tok in self._UNRECOVERABLE):
                     dns_failures += 1
                     if dns_failures >= 2:

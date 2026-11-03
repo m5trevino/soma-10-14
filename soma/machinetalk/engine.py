@@ -522,7 +522,8 @@ class Engine:
         # The old spinner is deliberately not started here — two owners drew
         # two lines per stage and the spinner froze on "✓" even for failures.
         timer = progress.StageTimer(stage, sid, cs.source_chunk_id or n,
-                                    cs.chars, model=model)
+                                    cs.chars, model=model,
+                                    model_fn=lambda: self.client.model_for(stage))
         timer.start()
         self._stage_timer = timer
 
