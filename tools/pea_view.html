@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PEA · Machine Room</title>
+<style>
+/* ══════════════════════════════════════════════════════════════════════
+   Materials: oiled leather bed, brushed aluminum chassis, smoked glass
+   panels, machined knobs, amber emissive type. Every surface has thickness
+   and casts a shadow onto the plane beneath it.
+   ══════════════════════════════════════════════════════════════════════ */
+
+:root{
+  --leather:#191310;
+  --leather-lit:#241b16;
+  --alu:#8f9499;
+  --alu-hi:#c8ccd1;
+  --alu-lo:#4a5055;
+  --glass:rgba(190,215,235,.055);
+  --glass-edge:rgba(190,215,235,.14);
+  --amber:#ff7a1c;
+  --amber-hi:#ffb066;
+  --amber-dim:rgba(255,122,28,.28);
+  --red:#ff3b30;
+  --green:#42d97a;
+  --ink:#e8e2d8;
+  --ink-dim:#a89c8d;
+  --ink-faint:#6d6155;
+}
+
+*{box-sizing:border-box}
+
+html,body{height:100%}
+body{
+  margin:0; padding:34px 30px 60px; min-height:100%; color:var(--ink);
+  font:14px/1.55 ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  background:
+    radial-gradient(1200px 520px at 18% -8%, rgba(255,140,60,.075), transparent 62%),
+    radial-gradient(900px 700px at 92% 108%, rgba(0,120,190,.055), transparent 60%),
+    repeating-linear-gradient(97deg, rgba(255,255,255,.008) 0 1px, transparent 1px 3px),
+    linear-gradient(172deg,#1d1611 0%, #150f0c 46%, #0e0a08 100%);
+  background-attachment:fixed;
+}
+
+/* grain over the whole bed */
+body::before{
+  content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
+  opacity:.05; mix-blend-mode:overlay;
+  background-image:url("data:image/svg+xml;utf8,\
+<svg xmlns='http://www.w3.org/2000/svg' width='140' height='140'>\
+<filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/></filter>\
+<rect width='140' height='140' filter='url(%23n)'/></svg>");
+}
+
+.wrap{position:relative; z-index:1; max-width:1180px; margin:0 auto}
+
+/* ── chrome header ─────────────────────────────────────────────────── */
+.plate{
+  display:flex; align-items:center; gap:18px; flex-wrap:wrap;
+  padding:15px 20px; margin-bottom:20px; border-radius:11px;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,0) 42%),
+    repeating-linear-gradient(90deg, rgba(255,255,255,.017) 0 1px, transparent 1px 2px),
+    linear-gradient(180deg,#262b30,#171b1f);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.20),
+    inset 0 -1px 0 rgba(0,0,0,.75),
+    0 2px 0 rgba(0,0,0,.55),
+    0 14px 30px -12px rgba(0,0,0,.95);
+  border:1px solid #30363c;
+}
+
+.mark{
+  font-size:15px; font-weight:700; letter-spacing:.20em; text-transform:uppercase;
+  color:var(--amber-hi);
+  text-shadow:0 0 14px rgba(255,122,28,.55), 0 1px 0 rgba(0,0,0,.9);
+}
+.mark small{
+  display:block; font-size:9.5px; letter-spacing:.34em; font-weight:400;
+  color:var(--ink-faint); text-shadow:none; margin-top:3px;
+}
+
+.spacer{flex:1}
+
+/* LED pill */
+.led{
+  display:flex; align-items:center; gap:8px; font-size:10.5px;
+  letter-spacing:.16em; text-transform:uppercase; color:var(--ink-dim);
+}
+.lamp{
+  width:9px; height:9px; border-radius:50%;
+  background:radial-gradient(circle at 35% 30%, #6b7076, #2a2e32);
+  box-shadow:inset 0 1px 1px rgba(255,255,255,.28), 0 1px 2px rgba(0,0,0,.8);
+  transition:background .3s, box-shadow .3s;
+}
+.lamp.on{
+  background:radial-gradient(circle at 35% 30%, #b6ffd0, var(--green));
+  box-shadow:0 0 10px rgba(66,217,122,.9), 0 0 22px rgba(66,217,122,.45),
+             inset 0 1px 1px rgba(255,255,255,.5);
+}
+.lamp.busy{
+  background:radial-gradient(circle at 35% 30%, #ffd2a8, var(--amber));
+  box-shadow:0 0 10px rgba(255,122,28,.95), 0 0 24px rgba(255,122,28,.5),
+             inset 0 1px 1px rgba(255,255,255,.5);
+  animation:pulse 1.1s ease-in-out infinite;
+}
+@keyframes pulse{50%{opacity:.5}}
+
+/* ── machined control ──────────────────────────────────────────────── */
+.btn{
+  position:relative; padding:8px 17px; border-radius:7px; cursor:pointer;
+  font:inherit; font-size:11.5px; font-weight:600; letter-spacing:.13em;
+  text-transform:uppercase; color:#cfd3d7;
+  background:linear-gradient(180deg,#33383d,#1b1f23);
+  border:1px solid #3d4349;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.16),
+    inset 0 -2px 3px rgba(0,0,0,.55),
+    0 2px 0 rgba(0,0,0,.6),
+    0 6px 12px -6px rgba(0,0,0,.9);
+  transition:transform .07s, box-shadow .07s, color .18s;
+}
+.btn:hover{color:#eef1f3; border-color:#4d545b}
+.btn:active{
+  transform:translateY(1px);
+  box-shadow:inset 0 2px 5px rgba(0,0,0,.7), 0 1px 0 rgba(0,0,0,.5);
+}
+.btn:disabled{opacity:.4; cursor:default; transform:none}
+
+/* amber "ON" style for the primary action */
+.btn.lit{
+  color:#2a1405;
+  background:linear-gradient(180deg,#ffab5e,#ef6c10);
+  border-color:#ff9a44;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.55),
+    inset 0 -2px 4px rgba(150,55,0,.5),
+    0 2px 0 #8a3d05,
+    0 0 20px rgba(255,122,28,.45),
+    0 8px 16px -6px rgba(0,0,0,.9);
+  text-shadow:0 1px 0 rgba(255,255,255,.35);
+}
+.btn.lit:hover{color:#1a0d02}
+
+/* recessed date well */
+.well{
+  display:inline-flex; align-items:center; gap:9px; padding:6px 11px;
+  border-radius:7px; font-size:10.5px; letter-spacing:.14em;
+  text-transform:uppercase; color:var(--ink-faint);
+  background:linear-gradient(180deg,#0b0806,#161011);
+  border:1px solid #241c17;
+  box-shadow:inset 0 2px 5px rgba(0,0,0,.85), 0 1px 0 rgba(255,255,255,.05);
+}
+input[type=date]{
+  background:transparent; border:0; color:var(--ink); font:inherit;
+  font-size:12px; letter-spacing:.05em; outline:none;
+}
+input[type=date]::-webkit-calendar-picker-indicator{
+  filter:invert(.6) sepia(.5) saturate(3) hue-rotate(-15deg); cursor:pointer;
+}
+
+/* ── view switch: physical toggle ──────────────────────────────────── */
+.rockers{
+  display:inline-flex; padding:3px; gap:3px; border-radius:8px;
+  background:linear-gradient(180deg,#0a0806,#171110);
+  border:1px solid #241c17;
+  box-shadow:inset 0 2px 6px rgba(0,0,0,.9), 0 1px 0 rgba(255,255,255,.05);
+}
+.rocker{
+  padding:6px 15px; border-radius:6px; border:0; cursor:pointer;
+  font:inherit; font-size:10.5px; letter-spacing:.15em; text-transform:uppercase;
+  color:var(--ink-faint); background:transparent; transition:all .14s;
+}
+.rocker.on{
+  color:#2a1405; font-weight:700;
+  background:linear-gradient(180deg,#ffab5e,#ef6c10);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.5), 0 0 14px rgba(255,122,28,.4),
+             0 1px 3px rgba(0,0,0,.7);
+  text-shadow:0 1px 0 rgba(255,255,255,.3);
+}
+
+/* ── glass panel ───────────────────────────────────────────────────── */
+.panel{
+  position:relative; border-radius:12px; padding:16px 18px; margin-bottom:14px;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,.055), rgba(255,255,255,.012) 30%),
+    linear-gradient(180deg, rgba(24,30,36,.86), rgba(12,15,18,.92));
+  border:1px solid var(--glass-edge);
+  backdrop-filter:blur(9px) saturate(1.15);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.15),
+    inset 0 -1px 0 rgba(0,0,0,.6),
+    0 1px 0 rgba(0,0,0,.5),
+    0 16px 34px -18px rgba(0,0,0,.95);
+}
+.panel::after{
+  content:""; position:absolute; inset:0; border-radius:12px; pointer-events:none;
+  background:linear-gradient(115deg, rgba(255,255,255,.05) 0%, transparent 34%);
+}
+
+/* readout strip */
+.strip{
+  display:flex; gap:26px; flex-wrap:wrap; padding:12px 18px;
+  border-radius:9px; margin-bottom:16px;
+  background:linear-gradient(180deg,#0a0806,#141010);
+  border:1px solid #221a16;
+  box-shadow:inset 0 2px 7px rgba(0,0,0,.9), 0 1px 0 rgba(255,255,255,.05);
+  font-size:11px; letter-spacing:.07em; color:var(--ink-faint);
+}
+.strip b{color:var(--amber-hi); font-weight:600; letter-spacing:.05em}
+.strip .k{text-transform:uppercase; letter-spacing:.16em; font-size:9.5px; display:block; margin-bottom:2px}
+
+/* ── directory cards (view A) ──────────────────────────────────────── */
+.dir{
+  margin-bottom:11px; border-radius:11px; overflow:hidden;
+  background:
+    repeating-linear-gradient(93deg, rgba(255,255,255,.014) 0 1px, transparent 1px 2px),
+    linear-gradient(180deg,#20262b,#14181b);
+  border:1px solid #333a41;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.14),
+    inset 0 -1px 0 rgba(0,0,0,.7),
+    0 2px 0 rgba(0,0,0,.55),
+    0 12px 24px -14px rgba(0,0,0,.95);
+}
+.dirhead{
+  display:flex; align-items:center; gap:14px; padding:13px 17px; cursor:pointer;
+  user-select:none; transition:background .15s;
+}
+.dirhead:hover{background:rgba(255,255,255,.028)}
+.caret{
+  width:0; height:0; flex:none; margin-left:2px;
+  border-left:7px solid var(--amber); border-top:5px solid transparent;
+  border-bottom:5px solid transparent;
+  filter:drop-shadow(0 0 5px rgba(255,122,28,.65));
+  transition:transform .18s;
+}
+.dir.open .caret{transform:rotate(90deg)}
+.dirname{
+  font-size:12.5px; font-weight:600; letter-spacing:.04em; color:#dfe3e7;
+  word-break:break-all;
+}
+.dirname em{color:var(--ink-faint); font-style:normal; font-weight:400}
+.count{
+  margin-left:auto; flex:none; padding:3px 10px; border-radius:20px;
+  font-size:10px; letter-spacing:.13em; text-transform:uppercase;
+  color:var(--amber-hi); background:rgba(255,122,28,.10);
+  border:1px solid rgba(255,122,28,.24);
+}
+.files{
+  display:none; padding:0 12px 12px;
+  background:linear-gradient(180deg, rgba(0,0,0,.34), rgba(0,0,0,.14));
+  border-top:1px solid rgba(0,0,0,.6);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.045);
+}
+.dir.open .files{display:block}
+
+/* ── file row ──────────────────────────────────────────────────────── */
+.row{
+  display:grid; grid-template-columns:1fr auto auto; gap:14px; align-items:center;
+  padding:9px 13px; margin-top:7px; border-radius:7px;
+  background:linear-gradient(180deg,#181d21,#101417);
+  border:1px solid #262d33;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.06), 0 2px 5px -3px rgba(0,0,0,.9);
+  transition:border-color .15s, transform .06s;
+}
+.row:hover{border-color:#3b444c}
+.fname{font-size:12px; color:#e2e6ea; word-break:break-all}
+.fmeta{
+  font-size:10px; letter-spacing:.09em; color:var(--ink-faint); margin-top:3px;
+  word-break:break-all;
+}
+.fmeta span{color:#8d959c}
+
+.badge{
+  flex:none; padding:2px 9px; border-radius:4px; font-size:9.5px;
+  letter-spacing:.14em; font-weight:700; text-transform:uppercase;
+}
+.badge.ok{color:#0d2417; background:linear-gradient(180deg,#63e89a,#2fb463);
+           box-shadow:0 0 12px rgba(66,217,122,.45), inset 0 1px 0 rgba(255,255,255,.4)}
+.badge.fail{color:#fff; background:linear-gradient(180deg,#ff6a5f,#d92b1f);
+             box-shadow:0 0 12px rgba(255,59,48,.45), inset 0 1px 0 rgba(255,255,255,.3)}
+
+.mini{
+  padding:5px 13px; border-radius:6px; cursor:pointer; font:inherit;
+  font-size:10px; letter-spacing:.14em; text-transform:uppercase;
+  color:#cfd3d7; background:linear-gradient(180deg,#2e343a,#1a1e22);
+  border:1px solid #3a4148;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.13), 0 2px 0 rgba(0,0,0,.55);
+  transition:transform .06s, box-shadow .06s, color .15s;
+}
+.mini:hover{color:#fff; border-color:#4c545c}
+.mini:active{transform:translateY(1px); box-shadow:inset 0 2px 5px rgba(0,0,0,.75)}
+.mini:disabled{opacity:.4; cursor:default}
+.mini.done{color:var(--green); border-color:rgba(66,217,122,.4)}
+
+/* ── bulk transport ────────────────────────────────────────────────── */
+.transport{display:flex; gap:12px; align-items:center; margin-bottom:16px}
+.gauge{
+  flex:1; height:9px; border-radius:6px; overflow:hidden;
+  background:linear-gradient(180deg,#0a0806,#171110);
+  border:1px solid #241c17;
+  box-shadow:inset 0 2px 5px rgba(0,0,0,.9);
+}
+.gauge i{
+  display:block; height:100%; width:0; transition:width .28s;
+  background:linear-gradient(180deg,#ffb067,#ef6c10);
+  box-shadow:0 0 14px rgba(255,122,28,.7), inset 0 1px 0 rgba(255,255,255,.45);
+}
+.gauge i.done{background:linear-gradient(180deg,#7cf0aa,#2fb463);
+              box-shadow:0 0 14px rgba(66,217,122,.7), inset 0 1px 0 rgba(255,255,255,.45)}
+.gauge i.bad{background:linear-gradient(180deg,#ff8a80,#d92b1f);
+             box-shadow:0 0 14px rgba(255,59,48,.7)}
+
+.tape{
+  margin-top:10px; padding:10px 13px; border-radius:7px; max-height:170px;
+  overflow:auto; font-size:11px; line-height:1.65; color:#8d959c;
+  white-space:pre-wrap; word-break:break-all;
+  background:linear-gradient(180deg,#080605,#110d0c);
+  border:1px solid #1e1714;
+  box-shadow:inset 0 2px 6px rgba(0,0,0,.9);
+}
+.tape::-webkit-scrollbar{width:8px}
+.tape::-webkit-scrollbar-thumb{background:#2a221d; border-radius:4px}
+
+.hint{font-size:10.5px; letter-spacing:.1em; color:var(--ink-faint);
+      text-transform:uppercase}
+.err{
+  padding:10px 14px; border-radius:8px; font-size:11.5px; margin-bottom:14px;
+  color:#ffb3ab; background:rgba(120,20,14,.30);
+  border:1px solid rgba(255,59,48,.32);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.06);
+}
+.empty{text-align:center; padding:52px 12px; color:var(--ink-faint);
+       font-size:12px; letter-spacing:.13em; text-transform:uppercase}
+</style></head>
+<body>
+<div class="wrap">
+
+  <div class="plate">
+    <div class="mark">PEA Archive<small>provenance · machine talk</small></div>
+    <div class="spacer"></div>
+    <div class="led"><span class="lamp" id="lamp"></span><span id="lampText">idle</span></div>
+    <div class="rockers">
+      <button class="rocker on" data-view="dirs">By run</button>
+      <button class="rocker" data-view="files">All files</button>
+    </div>
+    <div class="well"><label for="day">day</label><input type="date" id="day"></div>
+    <button class="btn" id="refresh">refresh</button>
+    <button class="btn lit" id="all">pull all</button>
+  </div>
+
+  <div class="strip">
+    <div><span class="k">files</span><b id="sFiles">—</b></div>
+    <div><span class="k">runs</span><b id="sRuns">—</b></div>
+    <div><span class="k">updated</span><b id="sUpd">—</b></div>
+    <div><span class="k">source</span><b id="sSrc">—</b></div>
+    <div><span class="k">saved locally</span><b id="sSaved">—</b></div>
+  </div>
+
+  <div class="transport">
+    <div class="gauge"><i id="fill"></i></div>
+    <div class="hint" id="pmeta">idle</div>
+  </div>
+  <div class="tape" id="jlog" hidden></div>
+
+  <div id="err"></div>
+  <div id="viewDirs"></div>
+  <div id="viewFiles"></div>
+  <div class="empty" id="empty" hidden>no files recorded for this day</div>
+
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const dayEl=$('day'), errEl=$('err'), emptyEl=$('empty');
+const viewDirs=$('viewDirs'), viewFiles=$('viewFiles');
+const fillEl=$('fill'), pmetaEl=$('pmeta'), jlogEl=$('jlog');
+const lampEl=$('lamp'), lampTextEl=$('lampText');
+let files=[], view='dirs';
+const saved=new Set();
+
+dayEl.value=new Date().toISOString().slice(0,10);
+
+/* stem helpers */
+const stageOf=n=>{const m=n.match(/-([a-z]+)-(SUCCESS|FAIL)\.txt$/); return m?m[1]:'—';};
+const isOk=n=>n.endsWith('SUCCESS.txt');
+const dirOf=e=>String(e.dir||'').split('/').pop()||'—';
+const clockOf=e=>{const t=(e.created||'').replace('T',' ').replace('Z',''); return t.slice(11,19)||'—';};
+const dateOf=e=>(e.created||'').slice(0,10);
+
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
+/* ── load ─────────────────────────────────────────────────────────── */
+async function load(){
+  lampEl.className='lamp busy'; lampTextEl.textContent='reading';
+  try{
+    const r=await fetch('/api/manifest?day='+encodeURIComponent(dayEl.value));
+    const d=await r.json();
+    errEl.innerHTML=d.error?'<div class="err">'+esc(d.error)+'</div>':'';
+    files=d.files||[];
+    $('sFiles').textContent=files.length;
+    $('sUpd').textContent=(d.updated||'—').replace('T',' ').replace('Z','');
+    $('sSrc').textContent='herbert';
+    const runs=new Set(files.map(dirOf));
+    $('sRuns').textContent=runs.size;
+    $('sSaved').textContent=saved.size;
+    emptyEl.hidden=files.length>0;
+    render();
+    lampEl.className='lamp on'; lampTextEl.textContent='live';
+  }catch(x){
+    errEl.innerHTML='<div class="err">'+esc(x)+'</div>';
+    lampEl.className='lamp'; lampTextEl.textContent='error';
+  }
+}
+
+/* ── render ───────────────────────────────────────────────────────── */
+function render(){
+  if(view==='files'){renderFiles();}else{renderDirs();}
+}
+
+function renderFiles(){
+  viewFiles.hidden=false; viewDirs.hidden=true;
+  if(!files.length){viewFiles.innerHTML='';return;}
+  const rows=files.slice().sort((a,b)=>(b.created||'').localeCompare(a.created||''));
+  viewFiles.innerHTML='<div class="panel">'+rows.map(e=>rowHtml(e,true)).join('')+'</div>';
+  bind();
+}
+
+function renderDirs(){
+  viewFiles.hidden=true; viewDirs.hidden=false;
+  if(!files.length){viewDirs.innerHTML='';return;}
+  const groups=new Map();
+  for(const e of files){
+    const k=dirOf(e);
+    if(!groups.has(k))groups.set(k,[]);
+    groups.get(k).push(e);
+  }
+  const keys=[...groups.keys()].sort().reverse();
+  viewDirs.innerHTML=keys.map(k=>{
+    const list=groups.get(k).slice().sort((a,b)=>(b.created||'').localeCompare(a.created||''));
+    return '<div class="dir" data-dir="'+esc(k)+'">'
+      +'<div class="dirhead"><span class="caret"></span>'
+      +'<span class="dirname">'+esc(k)+' <em>· '+list.length+' file'+(list.length===1?'':'s')+'</em></span>'
+      +'<span class="count">'+stageSpan(list)+'</span></div>'
+      +'<div class="files">'+list.map(e=>rowHtml(e,false)).join('')+'</div></div>';
+  }).join('');
+  bind();
+}
+
+function stageSpan(list){
+  const s=[...new Set(list.map(e=>stageOf(e.file)))];
+  return esc(s.slice(0,3).join(' · ')+(s.length>3?' +':''));
+}
+
+function rowHtml(e,showPath){
+  const ok=isOk(e.file);
+  const meta=showPath
+    ? '<div class="fmeta"><span>'+esc(dirOf(e))+'</span> · '+esc(e.path)+'</div>'
+    : '<div class="fmeta"><span>'+esc(clockOf(e))+'</span> · '+esc(e.path)+'</div>';
+  const isSaved=saved.has(e.file);
+  return '<div class="row" data-file="'+esc(e.file)+'" data-dir="'+esc(dirOf(e))+'" data-path="'+esc(e.path)+'">'
+    +'<div><div class="fname">'+esc(e.file)+'</div>'
+    +(showPath?'<div class="fmeta"><span>'+esc(clockOf(e))+'</span> · '+esc(dateOf(e))+'</div>':'')
+    +meta+'</div>'
+    +'<span class="badge '+(ok?'ok':'fail')+'">'+(ok?'success':'fail')+'</span>'
+    +'<button class="mini'+(isSaved?' done':'')+'">'+(isSaved?'saved':'read')+'</button>'
+    +'</div>';
+}
+
+function bind(){
+  document.querySelectorAll('.dirhead').forEach(h=>{
+    h.onclick=()=>h.parentElement.classList.toggle('open');
+  });
+  document.querySelectorAll('.row .mini').forEach(b=>{
+    b.onclick=ev=>{ev.stopPropagation();const row=b.closest('.row');pullOne(row,b);};
+  });
+}
+
+/* ── single pull ──────────────────────────────────────────────────── */
+async function pullOne(row,btn){
+  btn.disabled=true; btn.textContent='pulling';
+  lampEl.className='lamp busy'; lampTextEl.textContent='transferring';
+  const body={path:row.dataset.path,file:row.dataset.file,dir:row.dataset.dir};
+  try{
+    const r=await fetch('/api/pull',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)});
+    const d=await r.json();
+    if(d.ok){saved.add(body.file);btn.textContent=d.note==='already saved'?'saved':'saved';
+             btn.classList.add('done');$('sSaved').textContent=saved.size;
+             jlogEl.hidden=false;
+             jlogEl.textContent+=(jlogEl.textContent?'\n':'')
+               +new Date().toLocaleTimeString()+'  '+body.file+'  '+d.note;}
+    else{btn.disabled=false;btn.textContent='retry';
+         jlogEl.hidden=false;
+         jlogEl.textContent+=(jlogEl.textContent?'\n':'')
+           +new Date().toLocaleTimeString()+'  '+body.file+'  FAILED '+d.note;}
+  }catch(x){btn.disabled=false;btn.textContent='retry';}
+  lampEl.className='lamp on';lampTextEl.textContent='live';
+}
+
+/* ── bulk pull ────────────────────────────────────────────────────── */
+$('all').onclick=async()=>{
+  if(!files.length)return;
+  const btn=$('all');btn.disabled=true;
+  pmetaEl.textContent='sending command';jlogEl.hidden=false;jlogEl.textContent='';
+  lampEl.className='lamp busy';lampTextEl.textContent='pulling all';
+  try{
+    const r=await fetch('/api/pull-all',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({files})});
+    const d=await r.json();
+    if(!d.ok){pmetaEl.textContent=d.note||'could not start';btn.disabled=false;}
+  }catch(x){pmetaEl.textContent=String(x);btn.disabled=false;}
+};
+
+async function pollJob(){
+  try{
+    const r=await fetch('/api/job');const j=await r.json();
+    if(j.phase==='idle')return;
+    const pct=j.total?Math.round(100*j.done/j.total):0;
+    fillEl.style.width=pct+'%';
+    fillEl.className=j.failed?'bad':(j.phase==='complete'?'done':'');
+    const bits=[j.running?'running':'complete',
+                j.done+'/'+j.total+' saved'];
+    if(j.failed)bits.push(j.failed+' failed');
+    if(j.current)bits.push('→ '+j.current);
+    if(j.started)bits.push('start '+j.started);
+    if(j.finished)bits.push('end '+j.finished);
+    pmetaEl.textContent=bits.join('  ·  ');
+    if(j.log&&j.log.length){jlogEl.textContent=j.log.join('\n');
+      jlogEl.scrollTop=jlogEl.scrollHeight;}
+    $('sSaved').textContent=j.done;
+    if(!j.running){$('all').disabled=false;
+      lampEl.className='lamp on';lampTextEl.textContent='live';}
+  }catch(_){}
+}
+setInterval(pollJob,800);
+pollJob();
+
+/* ── view switch ──────────────────────────────────────────────────── */
+document.querySelectorAll('.rocker').forEach(b=>{
+  b.onclick=()=>{
+    document.querySelectorAll('.rocker').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on');view=b.dataset.view;render();
+  };
+});
+
+$('refresh').onclick=load;
+dayEl.onchange=load;
+load();
+setInterval(load,5000);
+</script>
+</html>

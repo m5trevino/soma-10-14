@@ -49,6 +49,12 @@ SOMA_DIR = Path(__file__).resolve().parent
 PICKER_DIR = SOMA_DIR / "soma-session-picker"
 TURNKEY_DIR = Path("/home/flintx/turn-key")
 
+# PEA log browser (tools/pea_viewer.py). Read-only: pea_sync.py owns syncing.
+PEA_LOG_PORT = 5199
+# The manifest viewer picks the next free port if this one is busy, so the
+# board probes the preferred one and falls back to whatever the process says.
+PEA_MANIFEST_PORT = 9893
+
 PEACOCK_DIR = Path.home() / "peacock"
 
 # PEA sync now runs the repo's own puller, which fetches every session into
@@ -260,6 +266,17 @@ SPECS: list[Spec] = [
         probe=None,
         url=None,
     ),
+    Spec(
+        key="pealogs",
+        title="PEA Manifests",
+        target="browser · port 9893",
+        short="9893",
+        hint="read or download one, or all",
+        cwd=SOMA_DIR,
+        command="python3 tools/pea_manifest_view.py",
+        probe=lambda: port_open(PEA_MANIFEST_PORT),
+        url=lambda: f"http://127.0.0.1:{PEA_MANIFEST_PORT}",
+    ),
 ]
 
 BY_KEY = {spec.key: spec for spec in SPECS}
@@ -422,6 +439,12 @@ class SyncStrip(Static):
 # ── app ──────────────────────────────────────────────────────────────────
 
 class SomaBoard(App):
+    # Tile grid geometry is derived from SPECS in compose().
+    # It used to be hardcoded to 2x2, which silently clipped the fifth tile:
+    # the "soma" engine tile (run_sessions.py) was composed but off-screen,
+    # so the board showed four tiles and the main app could not be launched.
+    _COLS = 2
+
     CSS = """
     Screen {
         background: #080c10;
@@ -438,9 +461,6 @@ class SomaBoard(App):
 
     #grid {
         layout: grid;
-        grid-size: 2 2;
-        grid-rows: 1fr 1fr;
-        grid-columns: 1fr 1fr;
         grid-gutter: 1 2;
         padding: 0 2;
         height: 1fr;
@@ -500,6 +520,7 @@ class SomaBoard(App):
         Binding("2", "launch_key('turnkey')", "", priority=True),
         Binding("3", "launch_key('dashboard')", "", priority=True),
         Binding("4", "launch_key('soma')", "", priority=True),
+        Binding("5", "launch_key('pealogs')", "", priority=True),
         Binding("p", "start_sync", "pea sync", priority=True),
     ]
 
@@ -518,6 +539,17 @@ class SomaBoard(App):
         yield Static(self._bar_text(), id="bar")
 
     def on_mount(self) -> None:
+        # Size the tile grid to the tile count. A fixed 2x2 grid composed all
+        # five tiles but clipped the last one off-screen, which hid the Soma
+        # engine tile (run_sessions.py) entirely.
+        rows = max(1, -(-len(SPECS) // self._COLS))
+        try:
+            grid = self.query_one("#grid", Grid)
+            grid.styles.grid_size_columns = self._COLS
+            grid.styles.grid_size_rows = rows
+        except Exception:
+            pass
+
         tiles = list(self.query(Tile))
         if tiles:
             self.set_focus(tiles[0])

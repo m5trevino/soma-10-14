@@ -155,201 +155,6 @@ def start_bulk(files: list[dict]) -> bool:
     return True
 
 
-PAGE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>PEA manifests</title>
-<style>
- :root { color-scheme: dark; }
- body { background:#0b0d12; color:#d8dbe2; font:14px/1.5 ui-monospace,monospace;
-        margin:0; padding:18px 22px; }
- h1 { font-size:15px; font-weight:600; margin:0 0 2px; color:#7fd1e0; }
- .sub { color:#6b7280; font-size:12px; margin-bottom:14px; }
- .bar { display:flex; gap:10px; align-items:center; margin-bottom:12px; }
- input[type=date] { background:#151922; color:#d8dbe2; border:1px solid #262c38;
-        border-radius:5px; padding:4px 7px; font:inherit; }
- button { background:#151922; color:#8fd3e6; border:1px solid #2b3444;
-        border-radius:5px; padding:4px 11px; font:inherit; cursor:pointer; }
- button:hover { border-color:#3f6f80; color:#bfeaf5; }
- button:disabled { opacity:.45; cursor:default; }
- .dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
- table { width:100%; border-collapse:collapse; }
- th { text-align:left; font-weight:600; color:#8a93a3; font-size:11px;
-      text-transform:uppercase; letter-spacing:.06em; padding:6px 8px;
-      border-bottom:1px solid #222836; }
- td { padding:6px 8px; border-bottom:1px solid #171c26; vertical-align:top; }
- tr:hover td { background:#10141c; }
- .f { color:#e2e6ee; }
- .ok { color:#3ddc84; } .fail { color:#ff5f6d; }
- .when { color:#6b7280; }
- .st { font-size:12px; }
- .err { color:#ff8a8a; background:#1d1114; border:1px solid #3a1d22;
-        padding:8px 10px; border-radius:5px; margin-bottom:12px; }
- .empty { color:#5b6472; padding:24px 2px; }
- .all { background:#16281f; color:#7fe0a0; border-color:#2c5140; }
- .all:hover { border-color:#3f7a5c; color:#b6f5cc; }
- .prog { margin:10px 0 14px; }
- .track { height:5px; background:#151922; border:1px solid #222836;
-          border-radius:3px; overflow:hidden; }
- .fill { height:100%; width:0; background:#3f7a5c; transition:width .25s; }
- .pmeta { color:#8a93a3; font-size:12px; margin-top:5px; }
- .jlog { background:#0d1016; border:1px solid #1b2029; border-radius:5px;
-         margin-top:8px; padding:8px 10px; max-height:190px; overflow:auto;
-         font-size:12px; color:#8892a3; white-space:pre-wrap; }
-</style></head><body>
-<h1>PEA manifests</h1>
-<div class="sub" id="sub">reading&hellip;</div>
-<div class="bar">
-  <label>day <input type="date" id="day"></label>
-  <button id="refresh">refresh</button>
-  <button id="all" class="all">download all</button>
-  <span class="st" id="state"></span>
-</div>
-<div class="prog">
-  <div class="track"><div class="fill" id="fill"></div></div>
-  <div class="pmeta" id="pmeta">idle</div>
-  <div class="jlog" id="jlog" hidden></div>
-</div>
-<div id="err"></div>
-<table><thead><tr>
-  <th style="width:46%">file</th><th style="width:16%">stage</th>
-  <th style="width:16%">created</th><th style="width:22%"></th>
-</tr></thead><tbody id="rows"></tbody></table>
-<div class="empty" id="empty" hidden>no files written today yet</div>
-<script>
-const dayEl = document.getElementById('day');
-const rowsEl = document.getElementById('rows');
-const stateEl = document.getElementById('state');
-const subEl = document.getElementById('sub');
-const errEl = document.getElementById('err');
-const emptyEl = document.getElementById('empty');
-
-const today = new Date().toISOString().slice(0,10);
-dayEl.value = today;
-
-function stageOf(f){
-  const m = f.replace(/^.*?-([a-z]+)-(SUCCESS|FAIL)\\.txt$/, '$1');
-  return m === f ? '—' : m;
-}
-function okOf(f){ return f.endsWith('SUCCESS.txt'); }
-
-async function load(){
-  const day = dayEl.value || today;
-  stateEl.textContent = '·';
-  try {
-    const r = await fetch('/api/manifest?day=' + encodeURIComponent(day));
-    const d = await r.json();
-    errEl.innerHTML = d.error ? '<div class="err">' + d.error + '</div>' : '';
-    subEl.textContent = d.files.length + ' file' + (d.files.length===1?'':'s')
-      + ' · ' + (d.count||0) + ' recorded · updated ' + (d.updated || '—')
-      + ' · source ' + d.source;
-    rowsEl.innerHTML = '';
-    emptyEl.hidden = d.files.length > 0;
-    currentFiles = d.files;
-    for (const e of d.files.slice().reverse()){
-      const tr = document.createElement('tr');
-      const ok = okOf(e.file);
-      tr.innerHTML =
-        '<td class="f">' + e.file + '</td>' +
-        '<td>' + stageOf(e.file) + '</td>' +
-        '<td class="when">' + (e.created||'').replace('T',' ').replace('Z','') + '</td>' +
-        '<td></td>';
-      const cell = tr.lastElementChild;
-      const b = document.createElement('button');
-      b.textContent = 'read';
-      b.onclick = () => read(e, b, cell);
-      cell.appendChild(b);
-      rowsEl.appendChild(tr);
-    }
-    stateEl.textContent = 'live';
-  } catch (x) {
-    stateEl.textContent = 'error';
-    errEl.innerHTML = '<div class="err">' + x + '</div>';
-  }
-}
-
-async function read(e, btn, cell){
-  btn.disabled = true;
-  cell.innerHTML = '<span class="st">pulling…</span>';
-  try {
-    const r = await fetch('/api/pull', {method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({path:e.path, file:e.file, dir:e.dir})});
-    const d = await r.json();
-    if (d.ok){
-      cell.innerHTML = '<span class="st ok">' + d.note + '</span> ' +
-        '<a href="/file?p=' + encodeURIComponent(d.local) +
-        '" target="_blank" style="color:#8fd3e6">open</a>';
-    } else {
-      cell.innerHTML = '<span class="st fail">' + d.note + '</span>';
-      btn.disabled = false; cell.appendChild(btn);
-    }
-  } catch (x) {
-    cell.innerHTML = '<span class="st fail">' + x + '</span>';
-    btn.disabled = false; cell.appendChild(btn);
-  }
-}
-
-document.getElementById('refresh').onclick = load;
-dayEl.onchange = load;
-
-// ── bulk download ──────────────────────────────────────────────────
-const allBtn = document.getElementById('all');
-const fillEl = document.getElementById('fill');
-const pmetaEl = document.getElementById('pmeta');
-const jlogEl = document.getElementById('jlog');
-let currentFiles = [];
-
-allBtn.onclick = async () => {
-  if (!currentFiles.length) return;
-  allBtn.disabled = true;
-  pmetaEl.textContent = 'sending command…';
-  jlogEl.hidden = false; jlogEl.textContent = '';
-  try {
-    const r = await fetch('/api/pull-all', {method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({files: currentFiles})});
-    const d = await r.json();
-    if (!d.ok) { pmetaEl.textContent = d.note || 'could not start'; allBtn.disabled = false; }
-  } catch (x) {
-    pmetaEl.textContent = String(x); allBtn.disabled = false;
-  }
-};
-
-async function pollJob(){
-  try {
-    const r = await fetch('/api/job');
-    const j = await r.json();
-    if (j.phase === 'idle'){ return; }
-    const pct = j.total ? Math.round(100 * j.done / j.total) : 0;
-    fillEl.style.width = pct + '%';
-    fillEl.style.background = j.phase === 'complete' && !j.failed
-      ? '#3ddc84' : (j.failed ? '#c2503d' : '#3f7a5c');
-    const bits = [];
-    if (j.running) bits.push('running');
-    else bits.push('complete');
-    bits.push(j.done + '/' + j.total + ' saved');
-    if (j.failed) bits.push(j.failed + ' failed');
-    if (j.current) bits.push('→ ' + j.current);
-    if (j.started) bits.push('start ' + j.started);
-    if (j.finished) bits.push('end ' + j.finished);
-    pmetaEl.textContent = bits.join(' · ');
-    if (j.log && j.log.length){
-      jlogEl.textContent = j.log.join('\\n');
-      jlogEl.scrollTop = jlogEl.scrollHeight;
-    }
-    allBtn.disabled = j.running;
-    if (!j.running) allBtn.disabled = false;
-  } catch (_) {}
-}
-setInterval(pollJob, 800);
-pollJob();
-
-document.getElementById('refresh').onclick = load;
-load();
-setInterval(load, 5000);
-</script></body></html>
-"""
-
-
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -368,7 +173,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         if u.path in ("/", "/index.html"):
-            self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+            # The page lives in its own file so the hardware styling can be
+            # edited without touching the server logic.
+            page = Path(__file__).with_name("pea_view.html")
+            if page.is_file():
+                self._send(200, page.read_bytes(), "text/html; charset=utf-8")
+            else:
+                self._send(500, b"pea_view.html missing beside the server",
+                           "text/plain; charset=utf-8")
             return
         if u.path == "/api/manifest":
             day = (parse_qs(u.query).get("day") or [""])[0]
