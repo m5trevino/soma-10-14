@@ -251,7 +251,13 @@ class Engine:
         # One identifier for this pipeline run. Every PEA file this run
         # produces is filed under it, so a session directory holds one run's
         # calls instead of every run that ever touched the same chat log.
-        self.run_id = time.strftime("%Y%m%d-%H%M%S")
+        #
+        # Two runs must never share a directory. A second is too coarse: two
+        # runs started in the same second would collide, and the engine
+        # appends to whatever directory already exists. The microsecond
+        # suffix keeps the name unique without asking the filesystem.
+        self.run_id = (time.strftime("%Y%m%d-%H%M%S")
+                       + f"-{time.time_ns() % 1_000_000:06d}")
         self._manifest_lock = threading.Lock()
 
         # Soma graph store (per-session by default)

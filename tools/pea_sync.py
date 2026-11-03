@@ -137,8 +137,16 @@ def organise_dir(raw: Path) -> int:
     renamed = 0
     for seq, (stamp, path, stage, status) in enumerate(entries, start=1):
         target = raw / f"{stamp}-{seq:02d}-{stage}-{status}.txt"
-        if target == path or target.exists():
+        if target == path:
             continue
+        # Two files must never share a name. The sequence number makes this
+        # unique within a run, but a re-sync can meet a name that already
+        # exists, and silently skipping that file would leave it under its
+        # raw remote name. Advance the sequence instead.
+        n = seq
+        while target.exists() and target != path:
+            n += 1
+            target = raw / f"{stamp}-{n:03d}-{stage}-{status}.txt"
         path.rename(target)
         renamed += 1
     return renamed
@@ -283,6 +291,124 @@ def sync_once(dest: Path, only: str | None = None) -> None:
                   f"{filed} filed")
 
 
+def _colour_enabled() -> bool:
+    """Colour only on a terminal, and only when NO_COLOR is unset."""
+    import os
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    return sys.stdout.isatty()
+
+
+class _C:
+    """ANSI codes, blanked when colour is off so widths stay correct."""
+    RESET = BOLD = DIM = DIR = FILE = GREEN = RED = ""
+    if _colour_enabled():
+        RESET = "\033[0m"
+        BOLD = "\033[1m"
+        DIM = "\033[2m"
+        DIR = "\033[1;36m"     # bold cyan: run directories
+        FILE = ""              # plain: log files
+        GREEN = "\033[32m"
+        RED = "\033[31m"
+
+
+def _online(timeout: int = 8) -> tuple[bool, str]:
+    """Whether the engine host answers SSH right now."""
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}",
+             REMOTE, "true"],
+            capture_output=True, text=True, timeout=timeout + 4)
+        if r.returncode == 0:
+            return True, "online"
+        err = (r.stderr or "").strip().splitlines()
+        last = err[-1] if err else "unreachable"
+        return False, (last.rsplit(": ", 1)[-1] or last)[:48]
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+    except Exception as exc:
+        return False, type(exc).__name__
+
+
+def _human_age(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s ago"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m ago"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f}h ago"
+    return f"{seconds / 86400:.1f}d ago"
+
+
+def status_report(dest: Path, limit: int | None = None,
+                  check_online: bool = True) -> None:
+    """Newest-first view of what is on disk and whether the engine is up.
+
+    Directories are bold and coloured, the files inside them are plain, so
+    the eye lands on run boundaries first and detail second.
+    """
+    runs = sorted((d for d in dest.iterdir()
+                   if d.is_dir() and d.name != ".incoming"),
+                  key=lambda d: d.name, reverse=True)
+    if not runs:
+        print(f"  {_C.DIM}no runs in {dest}{_C.RESET}")
+        return
+
+    # How many rows fit: one for the header, one per dir, one per file.
+    if limit is None:
+        try:
+            limit = max(10, shutil.get_terminal_size().lines - 6)
+        except OSError:
+            limit = 40
+
+    newest = max((p.stat().st_mtime for d in runs for p in d.glob("*.txt")),
+                 default=None)
+
+    if check_online:
+        up, why = _online()
+        state = (f"{_C.GREEN}● online{_C.RESET}" if up
+                 else f"{_C.RED}● offline{_C.RESET} {_C.DIM}({why}){_C.RESET}")
+    else:
+        state = f"{_C.DIM}● unchecked{_C.RESET}"
+
+    total = sum(1 for d in runs for _ in d.glob("*.txt"))
+    print()
+    print(f"  {_C.BOLD}PEA archive{_C.RESET}  {dest}")
+    print(f"  engine  {REMOTE}:{REMOTE_ROOT}  {state}")
+    print(f"  {len(runs)} runs · {total} files"
+          + (f" · last sync {_human_age(time.time() - newest)}"
+             if newest else ""))
+    print(f"  {_C.DIM}{'─' * 72}{_C.RESET}")
+
+    rows = 0
+    for d in runs:
+        if rows >= limit:
+            print(f"  {_C.DIM}… {len(runs) - runs.index(d)} more run(s){_C.RESET}")
+            break
+        files = sorted(d.glob("*.txt"), key=lambda p: p.name, reverse=True)
+        # Newest activity in this run, for runs that are still filling.
+        age = ""
+        if files:
+            newest_here = max(p.stat().st_mtime for p in files)
+            age = f"  {_C.DIM}{_human_age(time.time() - newest_here)}{_C.RESET}"
+        print(f"  {_C.DIR}{d.name}/{_C.RESET}"
+              f"  {_C.DIM}{len(files)} file(s){_C.RESET}{age}")
+        rows += 1
+        shown = 0
+        for f in files:
+            if rows >= limit:
+                print(f"    {_C.DIM}… {len(files) - shown} more file(s){_C.RESET}")
+                rows += 1
+                break
+            ok = f.name.endswith("-OK.txt")
+            mark = (f"{_C.GREEN}OK{_C.RESET}" if ok
+                    else f"{_C.RED}FAIL{_C.RESET}")
+            print(f"    {_C.FILE}{f.name}{_C.RESET}  {mark}")
+            rows += 1
+            shown += 1
+    print()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Pull PEA files into a local archive")
     ap.add_argument("--dest", default=str(DEFAULT_DEST))
@@ -290,10 +416,18 @@ def main() -> int:
     ap.add_argument("--watch", action="store_true",
                     help="keep syncing in a loop")
     ap.add_argument("--interval", type=int, default=30)
+    ap.add_argument("--status", action="store_true",
+                    help="show what is on disk, newest first, and exit")
+    ap.add_argument("--last", type=int, default=None,
+                    help="with --status: how many rows to show")
     args = ap.parse_args()
 
     dest = Path(args.dest).expanduser()
     dest.mkdir(parents=True, exist_ok=True)
+
+    if args.status:
+        status_report(dest, limit=args.last)
+        return 0
 
     if args.watch:
         print(f"watching {REMOTE}:{REMOTE_ROOT} -> {dest} every {args.interval}s")
@@ -306,8 +440,7 @@ def main() -> int:
             return 0
 
     sync_once(dest, args.session)
-    total = sum(1 for _ in dest.rglob("*.txt"))
-    print(f"\n{dest}  ({total} files)")
+    status_report(dest, limit=args.last)
     return 0
 
 
