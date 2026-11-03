@@ -216,7 +216,11 @@ def sync_once(dest: Path, only: str | None = None) -> None:
         # directory answers "what did this pipeline run do"; a session
         # directory alone answers nothing, because every run wrote into it.
         if run_id:
-            target = dest / run_id / chat_session
+            # Newer engine: the remote directory name already identifies one
+            # run. File it flat, "<run>--<session>", so every run directory
+            # sits at the same level whether it was named by the engine or
+            # reconstructed from timestamps.
+            target = dest / f"{run_id}--{chat_session}"
             before = set(p.name for p in target.glob("*.txt")) if target.is_dir() else set()
             if not _rsync(f"{session}/", target):
                 continue
