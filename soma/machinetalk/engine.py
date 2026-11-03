@@ -816,23 +816,34 @@ class Engine:
             # signal. Everything downstream extracts from what the distiller
             # produced, so there is nothing to extract. Halt the chain here.
             #
-            # This runs before any force/not-ok handling because a skip is a
-            # successful outcome, not a failure: it returns ok=True, so a
+            # A skip is a successful outcome, so it returns ok=True and a
             # guard written as "not ok" never fires. Under --force the
             # checkpoint's SKIPPED marker is also ignored, which let
             # introbeaver run on an empty upstream and report DONE.
-            if stage == "distiller" and is_done(gate) and gate.skipped:
-                reason = gate.skip_reason or gate.verdict or "SKIPPED"
-                for s in _DOWNSTREAM.get("distiller", ()):
-                    if s in _all_stages and s in _run_stages:
-                        self.ck.cs_mark(sid, n, s, SKIPPED,
-                                        errors=f"upstream distiller skipped "
-                                               f"({reason})")
-                        result[s] = SKIPPED
-                        self._print(
-                            f"  ⊘ {s.upper()} skipped: distiller skipped "
-                            f"({reason})")
-                return result
+            #
+            # The gate object belongs to the stage runner and is not in scope
+            # here; the checkpoint carries the same decision.
+            if stage == "distiller":
+                _d = self.ck.cs_stage(sid, n, "distiller")
+                # A distiller skip is recorded as status DONE with skip_reason
+                # set, because stopping extraction is a successful decision,
+                # not a failure. Checking only for status SKIPPED therefore
+                # never matches a real skip; the skip_reason is the marker.
+                _skipped = (_d.get("status") == SKIPPED
+                            or (_d.get("status") == DONE
+                                and bool(_d.get("skip_reason"))))
+                if _skipped:
+                    reason = _d.get("skip_reason") or "SKIPPED"
+                    for s in _DOWNSTREAM.get("distiller", ()):
+                        if s in _all_stages and s in _run_stages:
+                            self.ck.cs_mark(sid, n, s, SKIPPED,
+                                            errors=f"upstream distiller "
+                                                   f"skipped ({reason})")
+                            result[s] = SKIPPED
+                            self._print(
+                                f"  ⊘ {s.upper()} skipped: distiller skipped "
+                                f"({reason})")
+                    return result
 
             # Stage 1 is a chain: a stage with no upstream has nothing to
             # work on. Previously a failed distiller still let introbeaver
