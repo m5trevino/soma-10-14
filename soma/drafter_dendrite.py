@@ -28,6 +28,7 @@ from typing import Any, Callable
 
 from store import Soma
 from workspace import workspace_for
+from pipeline.atm_runner import CleanRoom
 
 
 # ------------------------------------------------------------------
@@ -510,8 +511,19 @@ class DrafterDendrite:
             # Hard gate: refuse any path that escapes the workspace.
             if not str(resolved).startswith(str(workspace_resolved) + "/"):
                 return None
+
+            # ATM protocol (TB-ATM-001): generated code is staged inside a
+            # sterile clean room where only this file is reachable and no
+            # directory-scanning tool exists, then read back out and the room
+            # is wiped. The agent that produced this payload therefore never
+            # touches the workspace or the repo directly.
+            room_id = f"drafter-{self._sanitize_session_id(session_id)}"
+            with CleanRoom(slice_id=room_id) as room:
+                room.write_file(rel_path, code_payload)
+                draft = room.result(rel_path)
+
             resolved.parent.mkdir(parents=True, exist_ok=True)
-            resolved.write_text(code_payload, encoding="utf-8")
+            resolved.write_text(draft, encoding="utf-8")
             return str(resolved)
         except Exception:
             return None
