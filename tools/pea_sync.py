@@ -230,19 +230,41 @@ def sync_once(dest: Path, only: str | None = None) -> None:
 
         # Older engine: the remote directory holds every run of this session.
         # Stage into a holding area, then split by time gap into run dirs.
+        #
+        # The holding area is emptied every pass, so "new" cannot be measured
+        # from it. Filed files are also renamed into chronological order, so
+        # their names no longer match the remote ones. Each run directory
+        # therefore records the remote names it consumed in .sources, and a
+        # pass counts only files whose remote name appears in none of them.
+        # Without that index every pass re-pulls and re-files the whole
+        # session forever.
         holding = dest / ".incoming" / chat_session
-        before = set(p.name for p in holding.glob("*.txt")) if holding.is_dir() else set()
         if not _rsync(f"{session}/", holding):
             continue
-        new = len(set(p.name for p in holding.glob("*.txt")) - before)
 
-        runs = group_runs(sorted(holding.glob("*.txt")))
+        already: set[str] = set()
+        for d in dest.iterdir():
+            if not d.is_dir() or not d.name.endswith(f"--{chat_session}"):
+                continue
+            idx = d / ".sources"
+            if idx.is_file():
+                already.update(idx.read_text().split())
+        incoming = sorted(holding.glob("*.txt"))
+        fresh = [p for p in incoming if p.name not in already]
+        new = len(fresh)
+
+        runs = group_runs(incoming)
         filed = 0
         for run in runs:
             first = min(_file_epoch(p) or 0.0 for p in run)
             tag = _datetime.datetime.fromtimestamp(first).strftime("%Y%m%d-%H%M%S")
             run_dir = dest / f"{tag}--{chat_session}"
             run_dir.mkdir(parents=True, exist_ok=True)
+            # Record the remote names this run consumed before renaming them.
+            idx = run_dir / ".sources"
+            seen = set(idx.read_text().split()) if idx.is_file() else set()
+            seen.update(p.name for p in run)
+            idx.write_text("\n".join(sorted(seen)) + "\n")
             for f in run:
                 run_dir.joinpath(f.name).unlink(missing_ok=True)
                 f.rename(run_dir / f.name)
