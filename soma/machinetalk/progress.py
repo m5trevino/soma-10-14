@@ -5,13 +5,23 @@ character and elapsed seconds, frozen with a single newline when it ends.
 After each chatset finishes → print header → divider → table → divider.
 After all chatsets → summary.
 
+Every session is shown by its short code (``SES-120``) and every stage by its
+own (``DI-01``), so a line reads ``[SES-120][DI-01] DISTILLER``. A finished
+stage also prints the wall-clock time it started, the duration it measured,
+and an absolute ``file://`` link to its log, because a relative path cannot be
+clicked.
+
 No interleaved logs, no live dashboard.
 """
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
+from pathlib import Path
+
+from . import short_codes
 
 
 # ── Primitives ──────────────────────────────────────────────────────────
@@ -74,6 +84,213 @@ _COL_HEADERS = [
 
 # Fixed column widths matching the user's spec exactly
 _COL_WIDTHS = [15, 12, 12, 22, 10, 10, 10, 34]
+
+
+# ── Codes and log links ─────────────────────────────────────────────────
+#
+# The terminal shows the codes a human can quote: ``SES-120`` for a session
+# and ``DI-01`` for a stage. The uuid is never printed, and a code that cannot
+# be resolved degrades to a literal ``unknown`` rather than raising — display
+# code must not be able to take a run down.
+
+_UNKNOWN_CODE = "unknown"
+
+#: Stage turn shown on screen. The pipeline runs one turn per stage today;
+#: the code carries the number so a later multi-turn run needs no new format.
+STAGE_TURN = 1
+
+
+def _remember(session_id: str, code: str) -> str:
+    """Record the id -> code pairing so printed text can be scrubbed."""
+    if session_id:
+        with _SEEN_LOCK:
+            _SEEN[session_id] = code
+    return code
+
+
+def _session_code(session_id: str, code: str | None = None) -> str:
+    """Short session code, or ``unknown`` when it cannot be resolved.
+
+    ``code`` is the run's already-resolved value. When the caller passes it,
+    no store lookup happens here: the display reads the same code the run
+    resolved at selection instead of asking a store that may have changed
+    since. Without it this module still resolves its own, which keeps direct
+    callers (tests, one-off renders) working.
+
+    Resolving a code also records it, so text built elsewhere with the raw id
+    can be scrubbed at print time.
+    """
+    sid = str(session_id or "").strip()
+    if code:
+        return _remember(sid, code)
+    try:
+        resolved = short_codes.code_for(sid)
+    except Exception:  # noqa: BLE001 - display must not raise
+        return _UNKNOWN_CODE
+    return _remember(sid, resolved)
+
+
+def _stage_code(stage: str, turn: int = STAGE_TURN) -> str:
+    """Short stage code, or ``unknown`` for a stage outside the map."""
+    try:
+        return short_codes.stage_code(stage, turn)
+    except Exception:  # noqa: BLE001 - display must not raise
+        return _UNKNOWN_CODE
+
+
+def code_tag(stage: str, session_id: str, turn: int = STAGE_TURN,
+             session_code: str | None = None) -> str:
+    """``[SES-120][DI-01]`` for one stage execution."""
+    return (f"[{_session_code(session_id, session_code)}]"
+            f"[{_stage_code(stage, turn)}]")
+
+
+#: Session ids seen on screen, mapped to their codes. The engine formats a
+#: few of its own lines with the raw id; keeping the ids here lets every
+#: printed string be scrubbed at the boundary, so the uuid cannot leak no
+#: matter which caller built the text.
+_SEEN: dict[str, str] = {}
+_SEEN_LOCK = threading.Lock()
+
+
+def _scrub(text: str) -> str:
+    """Replace every known session id in ``text`` with its short code."""
+    if not text or not _SEEN:
+        return text
+    with _SEEN_LOCK:
+        pairs = sorted(_SEEN.items(), key=lambda kv: len(kv[0]), reverse=True)
+    for sid, code in pairs:
+        if sid in text:
+            text = text.replace(sid, code)
+    return text
+
+
+_OUT_DIR: Path | None = None
+
+
+def set_output_dir(path) -> None:
+    """Tell the display where this run writes its logs.
+
+    The engine owns its output directory and the logger writes the session
+    sinks under it, so the engine sets it here once and every link printed
+    afterwards points at the file the logger actually wrote.
+    """
+    global _OUT_DIR
+    _OUT_DIR = Path(path) if path is not None else None
+
+
+def _cli_out_dir() -> Path | None:
+    """``--out`` from this process's own command line, if it was given.
+
+    The engine's output directory reaches the logger but not this module, and
+    the launcher and ``run_engine.py`` both pass it as ``--out``. Reading the
+    argv already in hand avoids a filesystem search and cannot pick up a
+    directory from an unrelated run.
+    """
+    argv = sys.argv[1:]
+    for i, arg in enumerate(argv):
+        if arg == "--out" and i + 1 < len(argv):
+            return Path(argv[i + 1])
+        if arg.startswith("--out="):
+            return Path(arg.split("=", 1)[1])
+    return None
+
+
+def output_dir() -> Path:
+    """Directory the stage logs live under.
+
+    Resolution order: what the engine registered, then ``SOMA_OUT_DIR``, then
+    this command's ``--out``, then the logger's own default of
+    ``<cwd>/pipeline_out``. Whichever wins, it is an absolute path, which is
+    what makes the link clickable.
+    """
+    if _OUT_DIR is not None:
+        return _OUT_DIR
+    override = os.environ.get("SOMA_OUT_DIR")
+    if override:
+        return Path(override)
+    cli = _cli_out_dir()
+    return cli if cli is not None else Path.cwd() / "pipeline_out"
+
+
+def _log_name(stage: str, session_id: str, turn: int = STAGE_TURN) -> str:
+    return f"{_session_code(session_id)}_{_stage_code(stage, turn)}.log"
+
+
+def _log_candidates(stage: str, session_id: str, out_dir=None,
+                    turn: int = STAGE_TURN) -> list[Path]:
+    """Absolute paths the sink could occupy, most authoritative first.
+
+    The engine owns its output directory and the logger writes there, while
+    this module is only told about it through ``set_output_dir`` or
+    ``SOMA_OUT_DIR``. Checking a short, fixed list lets a link point at the
+    file that exists instead of at a guess, and the list is never widened by
+    searching the filesystem.
+    """
+    name = _log_name(stage, session_id, turn)
+    rel = Path("logs") / stage.lower() / name
+    roots: list[Path] = []
+    if out_dir is not None:
+        roots.append(Path(out_dir))
+    if _OUT_DIR is not None:
+        roots.append(_OUT_DIR)
+    if os.environ.get("SOMA_OUT_DIR"):
+        roots.append(Path(os.environ["SOMA_OUT_DIR"]))
+    cli = _cli_out_dir()
+    if cli is not None:
+        roots.append(cli)
+    roots.append(Path.cwd() / "pipeline_out")
+    roots.append(Path.cwd())
+    return [(root / rel).resolve() for root in roots]
+
+
+def _discover_log(stage: str, session_id: str,
+                  turn: int = STAGE_TURN) -> Path | None:
+    """Find the sink the logger wrote, two directory levels under CWD.
+
+    The engine chooses its output directory and hands it to the logger, not
+    to this module; until it does, the sink still exists on disk under that
+    directory. Two levels is enough for ``<out>/logs/<stage>/`` and keeps the
+    lookup bounded — this never walks a tree.
+    """
+    name = _log_name(stage, session_id, turn)
+    tail = Path("logs") / stage.lower() / name
+    for depth in ("*", "*/*"):
+        try:
+            hits = sorted(Path.cwd().glob(str(Path(depth) / tail)))
+        except OSError:
+            return None
+        for hit in hits:
+            if hit.is_file():
+                return hit.resolve()
+    return None
+
+
+def log_path(stage: str, session_id: str, out_dir=None,
+             turn: int = STAGE_TURN) -> Path:
+    """The per-session per-stage log the logger writes for this execution.
+
+    The returned path is always absolute. A candidate that exists wins, then
+    a sink found under ``<cwd>/<something>/logs/<stage>/``, then the first
+    candidate — so the link points at a real file whenever one is there.
+    """
+    candidates = _log_candidates(stage, session_id, out_dir, turn)
+    for path in candidates:
+        if path.exists():
+            return path
+    found = _discover_log(stage, session_id, turn)
+    return found if found is not None else candidates[0]
+
+
+def log_uri(stage: str, session_id: str, out_dir=None,
+            turn: int = STAGE_TURN) -> str:
+    """Clickable absolute ``file://`` URI for this stage's log.
+
+    Built with ``Path.resolve().as_uri()`` rather than string concatenation,
+    so the path is absolute and correctly escaped. A relative path is not
+    clickable in any terminal that linkifies, which is the whole point.
+    """
+    return log_path(stage, session_id, out_dir, turn).resolve().as_uri()
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
@@ -169,15 +386,26 @@ def _row(cells: list[str], widths: list[int]) -> str:
 
 # ── Session Header ──────────────────────────────────────────────────────
 
-def session_header(session_id: str, total_sets: int) -> str:
-    """Session header block."""
+def session_header(session_id: str, total_sets: int,
+                   session_code: str | None = None) -> str:
+    """Session header block.
+
+    The line inside the frame is the session's short code. The uuid identifies
+    the session to the store; it means nothing to the operator reading the
+    screen and is far too long to scan.
+
+    ``session_code`` is the value the run resolved at selection. Passing it
+    means the header cannot disagree with the sink filenames or the debug
+    events, which are given the same value.
+    """
+    code = _session_code(session_id, session_code)
     h_top = ("┏◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚"
              "◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚◚┓")
     h_bot = ("┗◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛"
              "◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛◛┛")
     lines = [
         h_top,
-        session_id,
+        code,
         h_bot,
         "",
         "                    ▛▝▝▝▝▝▝▝▝▝▝▝▝▝▝▝▝▝▝▝▝ ▜",
@@ -518,11 +746,16 @@ class LiveTicker:
 _ticker: "LiveTicker | None" = None
 
 
+def _scrub_args(args: tuple) -> tuple:
+    """Apply the session-id scrub to string arguments of a print call."""
+    return tuple(_scrub(a) if isinstance(a, str) else a for a in args)
+
+
 def print_live(*args, **kwargs) -> None:
     """Print without destroying the live line underneath."""
     held = _ticker.clear() if _ticker is not None else False
     with _io_lock:
-        print(*args, **kwargs)
+        print(*_scrub_args(args), **kwargs)
         sys.stdout.flush()
     if held and _ticker is not None:
         _ticker.redraw()
@@ -535,7 +768,7 @@ def _flush_deferred() -> None:
             if _active_line is not None or not _deferred:
                 return
             args, kwargs = _deferred.pop(0)
-            print(*args, **kwargs)
+            print(*_scrub_args(args), **kwargs)
 
 
 def emit(*args, **kwargs) -> None:
@@ -575,6 +808,7 @@ def spin(label: str, fn, *args, **kwargs):
 # enough to be worth watching gets its own live line with a real model.
 
 _STAGE_START: dict[str, float] = {}
+_STAGE_WALL_START: dict[str, str] = {}
 _STAGE_TIMES: dict[str, list[tuple[float, str, str]]] = {}
 _STAGE_ORDER = ["distiller", "introbeaver", "planbeaver", "outrobeaver"]
 
@@ -598,8 +832,19 @@ def _timestamp() -> str:
 
 
 def stage_clock_start(stage: str) -> None:
-    """Record when a stage's model call began."""
+    """Record when a stage's model call began.
+
+    Two clocks are kept for the same instant. The monotonic one measures the
+    duration; the wall clock one is what the operator prints, because
+    ``31.4s`` says nothing about when the stage ran.
+    """
     _STAGE_START[stage] = time.monotonic()
+    _STAGE_WALL_START[stage] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def stage_wall_start(stage: str) -> str:
+    """Wall-clock time this stage's call began, or ``—`` if it never did."""
+    return _STAGE_WALL_START.get(stage, "—")
 
 
 def stage_clock_done(stage: str, status: str) -> float:
@@ -612,6 +857,7 @@ def stage_clock_done(stage: str, status: str) -> float:
 
 def stage_clock_reset() -> None:
     _STAGE_START.clear()
+    _STAGE_WALL_START.clear()
     _STAGE_TIMES.clear()
 
 
@@ -653,18 +899,29 @@ def _field(label: str, value: str, colour: str = "") -> str:
 
 
 def telemetry_header(stage: str, session: str, chatset, chars_in: int,
-                     model: str, provider: str) -> str:
-    """The opening block for one stage execution, before the call."""
+                     model: str, provider: str,
+                     session_code: str | None = None) -> str:
+    """The opening block for one stage execution, before the call.
+
+    The heading carries both codes, and the session field shows the code
+    rather than the uuid it was resolved from.
+
+    ``session_code`` is the run's resolved value; without it this header
+    would ask the store a second time and could print a different code than
+    the one the log sink is named after.
+    """
     label = _stage_label(stage)
     started = time.strftime("%Y-%m-%d %H:%M:%S")
+    ses = _session_code(session, session_code)
     lines = [
         "",
         _rule("═"),
-        f"  {_C_BOLD}{_C_CYAN}{label}{_C_RESET}"
-        f"{_C_DIM} · {stage}{_C_RESET}",
+        f"  {_C_BOLD}{_C_CYAN}{code_tag(stage, session, session_code=session_code)}"
+        f" {label}{_C_RESET}{_C_DIM} · {stage}{_C_RESET}",
         _rule(),
-        _field("started", started),
-        _field("session", session),
+        _field("start", started),
+        _field("session", ses),
+        _field("stage", _stage_code(stage)),
         _field("chatset", f"CS{chatset}"),
         _field("chars in", f"{chars_in:,}"),
         _field("model", model or "unknown"),
@@ -678,12 +935,17 @@ def telemetry_result(stage: str, *, elapsed: float, chars_in: int,
                      chars_out: int, prompt_tokens: int,
                      completion_tokens: int, total_tokens: int,
                      model: str, provider: str, status: str,
-                     verdict: str = "", detail: str = "") -> str:
+                     verdict: str = "", detail: str = "",
+                     session: str = "", out_dir=None) -> str:
     """The closing block for one stage execution, after it returns.
 
     Tokens are reported exactly as the provider returned them. A zero means
     the provider did not report usage, which is shown as ``—`` rather than
     ``0`` so an absent measurement is not mistaken for an empty one.
+
+    ``started`` and ``duration`` are separate labels on purpose: the first is
+    a wall-clock time, the second is measured elapsed seconds, and one cannot
+    be recovered from the other when several chatsets run in parallel.
     """
     glyph, colour = _verdict_glyph(status)
 
@@ -707,6 +969,7 @@ def telemetry_result(stage: str, *, elapsed: float, chars_in: int,
 
     lines = [
         _rule(),
+        _field("started", stage_wall_start(stage)),
         _field("finished", time.strftime("%Y-%m-%d %H:%M:%S")),
         _field("duration", f"{elapsed:.1f}s"),
         _field("chars out", f"{chars_out:,}{ratio}"),
@@ -720,6 +983,10 @@ def telemetry_result(stage: str, *, elapsed: float, chars_in: int,
     ]
     if detail:
         lines.append(_field("detail", detail[:96]))
+    if session:
+        # The link is the absolute file:// URI, never a relative path: a
+        # terminal can only make an absolute URI clickable.
+        lines.append(_field("log", log_uri(stage, session, out_dir)))
     lines.append(_rule("═"))
     lines.append("")
     return "\n".join(lines)
@@ -735,10 +1002,19 @@ class StageTimer:
     """
 
     def __init__(self, stage: str, session: str, chatset, chars: int,
-                 model: str = "", model_fn=None) -> None:
+                 model: str = "", model_fn=None, out_dir=None,
+                 session_code: str | None = None) -> None:
         self.stage = stage
         self.label = _stage_label(stage)
         self.session = session
+        # The uuid is kept for the log link and nothing else; every line
+        # this timer writes shows the resolved code. A code handed in is the
+        # one used: this timer never asks the store when the run has already
+        # decided.
+        self.ses_code = _session_code(session, session_code)
+        self.stg_code = _stage_code(stage)
+        self.tag = f"[{self.ses_code}][{self.stg_code}]"
+        self.out_dir = out_dir
         self.chatset = chatset
         self.chars = chars
         self.model = model or ""
@@ -749,10 +1025,14 @@ class StageTimer:
         self._stop = threading.Event()
         self._thread: "threading.Thread | None" = None
         self._started = 0.0
+        # Own wall-clock start, so several workers running the same stage in
+        # parallel cannot overwrite each other's clock.
+        self._wall_started = "—"
         self._is_distiller = stage == "distiller"
 
     def start(self) -> None:
         self._started = time.monotonic()
+        self._wall_started = time.strftime("%Y-%m-%d %H:%M:%S")
         stage_clock_start(self.stage)
 
         # The ticker owns the bottom line for every stage. Without it a
@@ -766,8 +1046,8 @@ class StageTimer:
             with _io_lock:
                 print(
                     f"  {_C_DIM}{_timestamp()}{_C_RESET} "
-                    f"{_C_CYAN}▶ {self.label}{_C_RESET} "
-                    f"{_C_DIM}{self.session} CS{self.chatset} "
+                    f"{_C_CYAN}▶ {self.tag} {self.label}{_C_RESET} "
+                    f"{_C_DIM}CS{self.chatset} "
                     f"{self.chars:,} chars{_C_RESET}",
                     flush=True,
                 )
@@ -798,7 +1078,7 @@ class StageTimer:
                 pass
         tail = f" · {model}" if model else ""
         tries = f"  {_C_DIM}(attempt {self.attempt}){_C_RESET}" if self.attempt > 1 else ""
-        return (f"  … {self.label}{tail} "
+        return (f"  … {self.tag} {self.label}{tail} "
                 f"[⏳ {elapsed:.1f}s elapsed]{tries}")
 
     def _spin(self) -> None:
@@ -813,7 +1093,7 @@ class StageTimer:
                 wait = mark - (time.monotonic() - self._started)
                 if self._stop.wait(max(0.0, wait)):
                     return
-                print_live(f"  … {self.label}"
+                print_live(f"  … {self.tag} {self.label}"
                            f"{' · ' + self.model if self.model else ''} "
                            f"[⏳ {mark}s elapsed]")
             return
@@ -840,7 +1120,7 @@ class StageTimer:
             print_live(
                 f"  {_C_DIM}{_timestamp()}{_C_RESET} "
                 f"{_C_GREEN}✓{_C_RESET} "
-                f"{_C_DIM}[{i:02d}/{n}]{_C_RESET} "
+                f"{_C_DIM}{self.tag} [{i:02d}/{n}]{_C_RESET} "
                 f"{_C_CYAN}{step}{_C_RESET} "
                 f"{_C_DIM}{dots} {elapsed:>4.0f}s{_C_RESET}")
 
@@ -853,7 +1133,7 @@ class StageTimer:
                 continue
             last = elapsed
             print_live(
-                f"  {_C_DIM}{_timestamp()}   … {self.label} still "
+                f"  {_C_DIM}{_timestamp()}   … {self.tag} {self.label} still "
                 f"waiting on the model ({elapsed:.0f}s){_C_RESET}")
 
     def finish(self, status: str, detail: str = "") -> float:
@@ -870,6 +1150,10 @@ class StageTimer:
             _ticker = None
 
         elapsed = stage_clock_done(self.stage, status)
+        # The timer's own start, not the shared per-stage entry: with several
+        # workers on one stage, the shared entry belongs to whichever started
+        # most recently.
+        started_at = self._wall_started
 
         if not self._is_distiller and sys.stdout.isatty():
             with _io_lock:
@@ -881,8 +1165,17 @@ class StageTimer:
         with _io_lock:
             print(
                 f"  {_C_DIM}{_timestamp()}{_C_RESET} "
-                f"{colour}{glyph} {self.label}{_C_RESET} "
-                f"{elapsed:>6.1f}s  {colour}{status}{_C_RESET}{tail}",
+                f"{colour}{glyph} {self.tag} {self.label}{_C_RESET} "
+                f"{_C_DIM}start{_C_RESET} {started_at}  "
+                f"{_C_DIM}duration{_C_RESET} {elapsed:>6.1f}s  "
+                f"{colour}{status}{_C_RESET}{tail}",
+                flush=True,
+            )
+            # Absolute file:// on its own line: a wrapped path is hard to
+            # click, and a relative one cannot be clicked at all.
+            print(
+                f"     {_C_DIM}log{_C_RESET} "
+                f"{log_uri(self.stage, self.session, self.out_dir)}",
                 flush=True,
             )
         return elapsed

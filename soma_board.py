@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
-"""SOMA board — a four-tile control panel for the Soma launchers.
+"""SOMA board — a seven-tile control panel for the Soma launchers.
 
 Each tile starts one service in its own terminal window. The window owns the
 process: closing the window stops the service. The board keeps no state, so it
 can be closed at any moment without affecting anything it launched. The lamps
 are live port checks, so they stay honest even for services started by hand.
 
-The PEA sync strip below the tiles is deliberately not a fifth tile: it is a
-background rsync loop with no window and no service manager, so it gets a
-status line instead. It reads the pid file the loop's starter writes, falls
-back to scanning /proc, and starts the loop detached when asked.
+The PEA sync strip below the tiles is deliberately not a tile: it is a
+background loop with no window and no service manager, so it gets a status
+line instead. It reads the pid file the loop's starter writes, falls back to
+scanning /proc, and starts the loop detached when asked.
+
+Layout: 2 columns × 4 rows:
+  [Droid Session Picker]  [Goose Session Picker]
+  [Turn Key Builder    ]  [Debug Dashboard      ]
+  [Engine TUI          ]  [Run Soma             ]
+  [PEA Manifests       ]
 
 Keys:
     arrows / tab   move between tiles and the sync strip
     space / enter  launch the focused tile, or start the sync when focused
-    1 2 3 4        launch a specific tile
+    1 2 3 4 5 6 7  launch a specific tile (1=Droid, 2=Goose, 3=Turnkey,
+                    4=Dashboard, 5=Engine TUI, 6=Run Soma, 7=PEA Manifests)
     p              start the PEA sync
     q              quit the board (does not stop anything)
 
@@ -45,24 +52,24 @@ from textual.binding import Binding
 from textual.containers import Grid
 from textual.widgets import Static
 
-SOMA_DIR = Path(__file__).resolve().parent
-PICKER_DIR = SOMA_DIR / "soma-session-picker"
 TURNKEY_DIR = Path("/home/flintx/turn-key")
-
+SOMA_DIR = Path("/home/flintx/soma-10-14")
+TUI_DIR = Path("/home/flintx/peacock-engine-tui-core")
+TUI_DIR = Path("/home/flintx/peacock-engine-tui-core")
+TUI_DIR = Path("/home/flintx/peacock-engine-tui-core")
+TUI_DIR = Path("/home/flintx/peacock-engine-tui-core")
 # PEA log browser (tools/pea_viewer.py). Read-only: pea_sync.py owns syncing.
 PEA_LOG_PORT = 5199
 # The manifest viewer picks the next free port if this one is busy, so the
 # board probes the preferred one and falls back to whatever the process says.
 PEA_MANIFEST_PORT = 9893
 
-PEACOCK_DIR = Path.home() / "peacock"
 
 # PEA sync now runs the repo's own puller, which fetches every session into
 # ~/pea-sessions/<session>/ and renames each file so the order is chronological
 # and the name carries the stage and outcome. The old rsync loop only mirrored
 # raw files and left them unlabelled.
 PEA_TOOL = SOMA_DIR / "tools" / "pea_sync.py"
-TUI_DIR = Path("/home/flintx/peacock-engine-tui-core")
 PEA_DEST = Path.home() / "pea-sessions"
 SYNC_SCRIPT = PEA_TOOL
 SYNC_PIDFILE = Path.home() / ".pea-sync.pid"
@@ -212,15 +219,26 @@ class Spec:
 
 SPECS: list[Spec] = [
     Spec(
-        key="picker",
-        title="Session Picker",
-        target="browser · port 5174",
-        short="5174",
+        key="droid-picker",
+        title="Droid Session Picker",
+        target="terminal · droid exec",
+        short="droid",
         hint="close the window to stop",
-        cwd=PICKER_DIR,
-        command="bash ./start-fg.sh",
-        probe=lambda: port_open(5174) and port_open(8001),
-        url=lambda: "http://localhost:5174",
+        cwd=SOMA_DIR,
+        command='/usr/local/bin/droid',
+        probe=None,
+        url=None,
+    ),
+    Spec(
+        key="goose-picker",
+        title="Goose Session Picker",
+        target="terminal · goose run",
+        short="goose",
+        hint="close the window to stop",
+        cwd=SOMA_DIR,
+        command='$HOME/.local/bin/goose',
+        probe=None,
+        url=None,
     ),
     Spec(
         key="turnkey",
@@ -262,7 +280,7 @@ SPECS: list[Spec] = [
         short="./run.sh",
         hint="exits when the run finishes",
         cwd=SOMA_DIR,
-        command="./run.sh",
+        command="./run.sh",   
         probe=None,
         url=None,
     ),
@@ -273,7 +291,9 @@ SPECS: list[Spec] = [
         short="9893",
         hint="read or download one, or all",
         cwd=SOMA_DIR,
-        command="python3 tools/pea_viewer.py",
+        # The board opens the tab once the port answers; without --no-open the
+        # viewer opens a second one itself.
+        command="python3 tools/pea_viewer.py --no-open",
         probe=lambda: port_open(PEA_MANIFEST_PORT),
         url=lambda: f"http://127.0.0.1:{PEA_MANIFEST_PORT}",
     ),
@@ -516,11 +536,13 @@ class SomaBoard(App):
         Binding("down", "focus_tile(1)", "next", priority=True),
         Binding("left", "focus_tile(-1)", "prev", priority=True),
         Binding("up", "focus_tile(-1)", "prev", priority=True),
-        Binding("1", "launch_key('picker')", "", priority=True),
-        Binding("2", "launch_key('turnkey')", "", priority=True),
-        Binding("3", "launch_key('dashboard')", "", priority=True),
-        Binding("4", "launch_key('soma')", "", priority=True),
-        Binding("5", "launch_key('pealogs')", "", priority=True),
+        Binding("1", "launch_key('droid-picker')", "", priority=True),
+        Binding("2", "launch_key('goose-picker')", "", priority=True),
+        Binding("3", "launch_key('turnkey')", "", priority=True),
+        Binding("4", "launch_key('dashboard')", "", priority=True),
+        Binding("5", "launch_key('tui')", "", priority=True),
+        Binding("6", "launch_key('soma')", "", priority=True),
+        Binding("7", "launch_key('pealogs')", "", priority=True),
         Binding("p", "start_sync", "pea sync", priority=True),
     ]
 
@@ -563,7 +585,8 @@ class SomaBoard(App):
         """The banner, tinted purple→green across the art, then the subtitle."""
         text = Text()
         try:
-            from banner import ART, TAGLINE, gradient_hex
+            sys.path.insert(0, str(SOMA_DIR))
+            from soma.banner import ART, TAGLINE, gradient_hex
         except ImportError:
             ART, TAGLINE = (), ""
 

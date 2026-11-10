@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import './App.css'
 import './components/FavoritesPanel.css'
 import SessionTable from './components/SessionTable'
+import ConsolidatedTable from './components/ConsolidatedTable'
 import FilterBar from './components/FilterBar'
 import StatusBar from './components/StatusBar'
 import SessionMetaPanel from './components/SessionMetaPanel'
@@ -24,8 +25,10 @@ function topLabel(value) {
 function App() {
   const [sessions, setSessions] = useState([])
   const [groups, setGroups] = useState([])
-  // "flat" = one row per session; "grouped" = one collapsible node per project.
-  const [viewMode, setViewMode] = useState('grouped')
+  const [consolidated, setConsolidated] = useState([])
+  const [consolidatedLoading, setConsolidatedLoading] = useState(false)
+  // "consolidated" = deduped chains (primary); "flat"/"grouped" = old search.
+  const [viewMode, setViewMode] = useState('consolidated')
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
   const [selected, setSelected] = useState(new Set())
@@ -171,6 +174,16 @@ function App() {
   useEffect(() => {
     fetchSessions()
   }, [fetchSessions])
+
+  // Fetch consolidated sessions (chains) — the primary view.
+  useEffect(() => {
+    setConsolidatedLoading(true)
+    fetch(`${API}/consolidated`)
+      .then((r) => r.json())
+      .then((d) => setConsolidated(d.sessions || []))
+      .catch(() => setConsolidated([]))
+      .finally(() => setConsolidatedLoading(false))
+  }, [])
 
   // Fetch metadata when a session is selected
   const fetchSessionMeta = useCallback(async (sessionId) => {
@@ -473,6 +486,27 @@ function App() {
     setExporting(false)
   }, [favorites, allFavorites, exportSelected])
 
+  // Consolidated export — write selected consolidated session paths to the queue.
+  const exportConsolidated = useCallback(async () => {
+    const paths = consolidated
+      .filter((s) => selected.has(s.session_id))
+      .map((s) => s.path)
+    if (paths.length === 0) {
+      setExportStatus('No consolidated sessions selected')
+      return
+    }
+    try {
+      await fetch(`${API}/select`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_ids: paths }),
+      })
+      setExportStatus(`✓ Exported ${paths.length} consolidated session(s) to queue`)
+    } catch (err) {
+      setExportStatus(err.message || 'Export failed')
+    }
+  }, [consolidated, selected])
+
   // When a row is clicked, show metadata
   const handleRowClick = useCallback((sessionId) => {
     setSelectedSessionId((prev) => {
@@ -534,6 +568,15 @@ function App() {
               title={`Add ${selected.size} selected sessions to favorites`}
             >
               + Add {selected.size} to Favorites
+            </button>
+          )}
+          {viewMode === 'consolidated' && selected.size > 0 && (
+            <button
+              className="btn-export-fav"
+              onClick={exportConsolidated}
+              title={`Write ${selected.size} consolidated session(s) to the Soma queue`}
+            >
+              Export {selected.size} Consolidated
             </button>
           )}
           {showFavoritesPanel && (
@@ -751,7 +794,13 @@ function App() {
       <div className="view-bar">
         <div className="rocker" role="tablist">
           <div className="rocker-slot">
-            <div className={`rocker-knob${viewMode === 'files' ? ' right' : ''}`}></div>
+            <div className={`rocker-knob${viewMode === 'flat' ? ' right' : ''}`}></div>
+            <button
+              className={viewMode === 'consolidated' ? 'on' : ''}
+              onClick={() => setViewMode('consolidated')}
+            >
+              Consolidated
+            </button>
             <button
               className={viewMode === 'grouped' ? 'on' : ''}
               onClick={() => setViewMode('grouped')}
@@ -767,27 +816,43 @@ function App() {
           </div>
         </div>
         <span className="view-hint">
-          {viewMode === 'grouped'
-            ? `${groups.length} projects · ${groups.reduce((n, g) => n + g.session_count, 0)} sessions`
-            : `${sessions.length} of ${total} sessions`}
+          {viewMode === 'consolidated'
+            ? `${consolidated.length} consolidated sessions`
+            : viewMode === 'grouped'
+              ? `${groups.length} projects · ${groups.reduce((n, g) => n + g.session_count, 0)} sessions`
+              : `${sessions.length} of ${total} sessions`}
         </span>
       </div>
 
       <div className="main-layout">
         <main className="main">
-          <SessionTable
-            sessions={displayedSessions}
-            groups={groups}
-            grouped={viewMode === 'grouped'}
-            selected={selected}
-            favorites={favorites}
-            loading={loading}
-            onToggleSelect={toggleSelect}
-            onToggleAll={() => setSelected(selected.size === sessions.length ? new Set() : new Set(sessions.map(s => s.session_id)))}
-            onToggleFavorite={toggleFavorite}
-            onRowClick={handleRowClick}
-            activeRowId={selectedSessionId}
-          />
+          {viewMode === 'consolidated' ? (
+            <ConsolidatedTable
+              sessions={consolidated}
+              selected={selected}
+              favorites={favorites}
+              loading={consolidatedLoading}
+              onToggleSelect={toggleSelect}
+              onToggleAll={() => setSelected(selected.size === consolidated.length ? new Set() : new Set(consolidated.map(s => s.session_id)))}
+              onToggleFavorite={toggleFavorite}
+              onRowClick={handleRowClick}
+              activeRowId={selectedSessionId}
+            />
+          ) : (
+            <SessionTable
+              sessions={displayedSessions}
+              groups={groups}
+              grouped={viewMode === 'grouped'}
+              selected={selected}
+              favorites={favorites}
+              loading={loading}
+              onToggleSelect={toggleSelect}
+              onToggleAll={() => setSelected(selected.size === sessions.length ? new Set() : new Set(sessions.map(s => s.session_id)))}
+              onToggleFavorite={toggleFavorite}
+              onRowClick={handleRowClick}
+              activeRowId={selectedSessionId}
+            />
+          )}
         </main>
 
         {/* Favorites panel — left sidebar */}

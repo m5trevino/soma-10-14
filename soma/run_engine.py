@@ -24,9 +24,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, "/workspace/artifacts/turn-key")
 
 from machinetalk.client import EngineClient
-from machinetalk.engine import run
+from machinetalk.engine import run, select_sessions, session_code_line
 from machinetalk.source import load_source
 from machinetalk.debug_dashboard_skeu import start_dashboard
+from machinetalk.short_codes import code_for
 
 
 def _log_output_path(output_path: str) -> None:
@@ -59,8 +60,15 @@ def load_queue(queue_path: str) -> list[Path]:
     ids = data.get("selected", [])
     paths = []
     for sid in ids:
-        # Try resolving the session_id to a session directory
-        # Format could be just the dir name or full session_id from dev_sessions
+        # Exact path first: a consolidated session lives under
+        # lineage/consolidated/<key> and must not be shadowed by a same-named
+        # source session under the base root.
+        exact = Path(sid)
+        if exact.is_dir():
+            paths.append(exact)
+            continue
+        # Try resolving the session_id to a session directory.
+        # Format could be just the dir name or full session_id from dev_sessions.
         base = Path("/media/storage/dendritic123/chat-logs/sessions")
         dir_name = sid.split("/")[-1]
         candidate = base / dir_name
@@ -68,11 +76,6 @@ def load_queue(queue_path: str) -> list[Path]:
             paths.append(candidate)
         elif (base / sid).exists():
             paths.append(base / sid)
-        else:
-            # Last resort: try it directly
-            d = Path(sid)
-            if d.exists():
-                paths.append(d)
     return paths
 
 
@@ -126,6 +129,28 @@ def main() -> int:
         print("Error: provide --source or --queue", flush=True)
         return 1
 
+    only = None
+    if args.only:
+        only = []
+        for spec in args.only:
+            sid, sep, num = spec.rpartition(":")
+            if not sep or not sid or not num.isdigit():
+                print(f"Error: --only expects SESSION:SET, got {spec!r}", flush=True)
+                return 1
+            only.append((sid, int(num)))
+
+    # ── Selection: one resolution per session, announced before any stage ──
+    #
+    # This is the run's only session-code lookup. The mapping is handed to
+    # run(), which pins it into the Engine so the logger, the debug events and
+    # the progress headers all read these values instead of resolving again.
+    # Printing here rather than deeper means the first thing a run writes is
+    # the code an operator will later grep for.
+    session_codes = {}
+    for session_id in select_sessions(sessions_list, only):
+        session_codes[session_id] = code_for(session_id)
+        print(session_code_line(session_codes[session_id]), flush=True)
+
     client = EngineClient(args.profile)
 
     # Dashboard prompt is handled by the parent launcher (run_sessions.py)
@@ -139,16 +164,6 @@ def main() -> int:
     ).start()
     print(f"Dashboard: http://127.0.0.1:{args.port}")
 
-    only = None
-    if args.only:
-        only = []
-        for spec in args.only:
-            sid, sep, num = spec.rpartition(":")
-            if not sep or not sid or not num.isdigit():
-                print(f"Error: --only expects SESSION:SET, got {spec!r}", flush=True)
-                return 1
-            only.append((sid, int(num)))
-
     ret = run(
         sessions_list,
         out_dir=Path(args.out),
@@ -161,6 +176,8 @@ def main() -> int:
         granular=args.granular,
         force=args.force,
         only=only,
+        session_codes=session_codes,
+        announced=True,
     )
     _log_output_path(args.out)
     return ret
@@ -177,7 +194,21 @@ def _ensure_engine_auth(profile_path: str) -> str:
     Returns the profile path unchanged when the environment supplies what is
     needed. Prints a single warning when the key is absent, because otherwise
     the failure surfaces later as 401s that look like model or gateway faults.
+
+    The TurnKey SDK loads every ``.env`` it can find from its own import
+    (``turnkey/sdk.py:_load_dotenv``), and that import happens inside
+    ``EngineClient.__init__`` -- after this function used to run. Checking the
+    raw environment here therefore warned about a key that was about to be
+    loaded, and the run then worked. Load first, then report what is actually
+    there.
     """
+    try:
+        from turnkey.sdk import _load_dotenv
+        _load_dotenv()
+    except Exception:
+        # An older SDK without the helper: fall through and report honestly on
+        # whatever the environment already holds.
+        pass
     if not os.environ.get("ENGINE_KEY"):
         print("  [warn] ENGINE_KEY is not set; inference calls will return 401",
               flush=True)
@@ -297,7 +328,12 @@ def _soma_only_run(args) -> int:
         return 1
 
     first_cs = first_session.chatsets[0]
-    print(f"SOMA-ONLY: session={first_session.session_id} set={first_cs.set_number} "
+    # Same selection rule as a full run: resolve once, print before the stage.
+    # This path has no Engine, so the code is resolved here and used here; it
+    # is not re-derived later because nothing later needs it.
+    session_code = code_for(first_session.session_id)
+    print(session_code_line(session_code), flush=True)
+    print(f"SOMA-ONLY: session={session_code} set={first_cs.set_number} "
           f"hash={first_cs.chatset_hash[:16]}...", flush=True)
 
     soma_path = str(Path(args.out) / "soma.json")

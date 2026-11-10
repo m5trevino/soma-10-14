@@ -1,0 +1,12 @@
+[Unit]
+Description=Publish PEA manifests from the engine to the web-served directory
+Documentation=file:/home/flintx/soma-10-14/deploy/README-pea-sync.md
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pea-manifest-sync.sh
+User=root
+Nice=10
+# One failed run must not leave the unit in a failed state that blocks the timer.
+SuccessExitStatus=0

@@ -37,6 +37,9 @@ QUEUE_OUTPUT_PATH = os.environ.get(
     str(Path.home() / ".soma_queue.json"),
 )
 
+# ── Consolidated sessions (chains) ────────────────────────────────────────
+CONSOLIDATED_DIR = Path("/media/storage/dendritic123/chat-logs/lineage/consolidated")
+
 # ── TurnKey profile path ──────────────────────────────────────────────────
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # soma-10-14
@@ -354,6 +357,49 @@ async def load_sessions_from_json(path: str = ""):
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "engine": "soma-session-picker"}
+
+
+@app.get("/api/consolidated")
+async def list_consolidated():
+    """List consolidated sessions (chains) from the lineage/consolidated dir."""
+    if not CONSOLIDATED_DIR.is_dir():
+        return {"sessions": [], "total": 0}
+
+    out = []
+    for d in sorted(CONSOLIDATED_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        sj = d / "session.json"
+        if not sj.is_file():
+            continue
+        try:
+            meta = json.loads(sj.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        prov = {}
+        pj = d / "provenance.json"
+        if pj.is_file():
+            try:
+                prov = json.loads(pj.read_text())
+            except (OSError, json.JSONDecodeError):
+                prov = {}
+
+        members = prov.get("source_members", []) or []
+        out.append({
+            "session_id": meta.get("session_id", d.name),
+            "provider": meta.get("provider", ""),
+            "total_sets": meta.get("total_sets", 0),
+            "total_session_chars": meta.get("total_session_chars", 0),
+            "models_used": meta.get("models_used", {}),
+            "source_count": len(members),
+            "source_members": members,
+            "dropped_chunks": prov.get("dropped_chunks", 0),
+            "emitted_chunks": prov.get("emitted_chunks", meta.get("total_sets", 0)),
+            "path": str(d),
+        })
+
+    return {"sessions": out, "total": len(out)}
 
 
 @app.get("/api/projects")

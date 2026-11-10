@@ -48,6 +48,7 @@ from .report import (Manifest, card_session_stage, write_artifact,
 from .source import ChatSet, Session
 from .logger import StageLogger
 from . import progress
+from . import short_codes
 
 # ── Stage-1 stages that drive the one-line spinner ───────────────────────
 _LIVE_STAGES = ("distiller", "introbeaver", "planbeaver", "outrobeaver")
@@ -58,6 +59,93 @@ _PREVIOUS_STAGE = {
     "planbeaver": "introbeaver",
     "outrobeaver": "planbeaver",
 }
+
+# ── Session short codes: resolved once, at selection ─────────────────────
+#
+# A run has exactly one code per session. It is resolved where the session is
+# selected and then handed to the logger, the debug event and the progress
+# header, so a run cannot announce ``SES-120`` at the top and write
+# ``SES-121`` into a stage sink because a second lookup ran after the store
+# changed underneath it.
+
+UNKNOWN_SESSION_CODE = "unknown"
+
+
+def session_code_line(code: str) -> str:
+    """The one line printed for a session before any stage starts.
+
+    ``session SES-120  (2026-11-03 18:40)``
+
+    The wall-clock stamp is the run's start, not the stage's: this line is
+    the first thing a run writes, so it is what an operator later greps for
+    when a log has to be matched to a run.
+    """
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    return f"session {code}  ({stamp})"
+
+
+class SessionCodes:
+    """One short code per session, resolved once for the life of a run.
+
+    The selection point hands in the codes it minted (``pinned``); nothing
+    downstream may re-derive them. A session missing from the map is resolved
+    on first ask and remembered, so a direct ``Engine`` user still works, but
+    a run that pins its codes performs exactly one store lookup per session
+    and every later surface reads the same value.
+
+    ``resolution_count`` counts the lookups this object performed, which is
+    what lets a test prove resolution happened once rather than once per
+    consumer. A code that cannot be resolved degrades to ``unknown``, the
+    same way the logger and the progress display degrade: display must not
+    take a run down.
+    """
+
+    def __init__(self, pinned: dict[str, str] | None = None,
+                 resolve=None) -> None:
+        self._by_session: dict[str, str] = dict(pinned or {})
+        self._resolve = resolve or short_codes.code_for
+        self._resolutions = 0
+        self._error = ""
+        self._lock = threading.Lock()
+
+    def resolve(self, session_id: str) -> str:
+        """The code for ``session_id``, minting it only if nothing pinned it."""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return UNKNOWN_SESSION_CODE
+        with self._lock:
+            code = self._by_session.get(sid)
+            if code:
+                return code
+            self._resolutions += 1
+            try:
+                code = self._resolve(sid)
+            except Exception as exc:  # noqa: BLE001 - a code never fails a run
+                self._error = f"{type(exc).__name__}: {exc}"
+                code = UNKNOWN_SESSION_CODE
+            self._by_session[sid] = code
+            return code
+
+    def code(self, session_id: str) -> str:
+        """The already-resolved code. Never mints, never looks anything up."""
+        with self._lock:
+            return self._by_session.get(str(session_id or "").strip(),
+                                        UNKNOWN_SESSION_CODE)
+
+    @property
+    def resolution_count(self) -> int:
+        with self._lock:
+            return self._resolutions
+
+    @property
+    def error(self) -> str:
+        with self._lock:
+            return self._error
+
+    def as_dict(self) -> dict[str, str]:
+        with self._lock:
+            return dict(self._by_session)
+
 
 def _payload_chars(payload: dict | None, fallback: int) -> int:
     """Size of the upstream output a stage consumes, in characters.
@@ -231,7 +319,9 @@ class Engine:
                  debug_dir: str | None = None,
                  max_chatsets: int | None = None,
                  step_mode: bool = False,
-                 soma_path: Path | None = None) -> None:
+                 soma_path: Path | None = None,
+                 session_codes: dict[str, str] | None = None,
+                 announced: bool = False) -> None:
         self.out = Path(out_dir)
         self.client = client
         self.workers = max(1, workers)
@@ -243,7 +333,24 @@ class Engine:
         self.ck = CheckpointStore(self.out, layout="chunk")
         self.manifest = Manifest(self.out)
         self.art_dir = self.out / "artifacts"
-        self.log = StageLogger(cwd=Path.cwd(), out_dir=self.out, quiet=quiet)
+        # The run's session codes. The selection point may pin them; a direct
+        # Engine user resolves lazily on first ask. Either way there is one
+        # holder, so the logger, the debug event and the progress header all
+        # read a value that was decided once.
+        self.session_codes = SessionCodes(pinned=session_codes)
+        self._announced: set[str] = set()
+        self._announce_lock = threading.Lock()
+        if announced:
+            # The caller printed the lines already (run_engine.py does, so the
+            # code is on screen before anything else can write).
+            self.mark_announced(self.session_codes.as_dict())
+        self.log = StageLogger(cwd=Path.cwd(), out_dir=self.out, quiet=quiet,
+                               session_codes=self.session_codes)
+        # The display builds a file:// link to the sink the logger writes, so
+        # it has to be told the same directory the logger was given. Without
+        # this the link fell back to <cwd>/pipeline_out and pointed at a file
+        # that was never written when --out was left at its default.
+        progress.set_output_dir(self.out)
         self._print = (lambda *a: None) if quiet else progress.emit
         self._debug_dir = Path(debug_dir) if debug_dir else None
         if self._debug_dir:
@@ -261,6 +368,37 @@ class Engine:
         self._print_lock = threading.Lock()
 
     # -- logging helpers (NEW) ---------------------------------------------
+
+    def mark_announced(self, session_ids) -> None:
+        """Record that these sessions' codes were printed by the caller.
+
+        ``run_engine.py`` prints the line at selection, before the Engine
+        exists. Telling the Engine what it printed keeps stage 1 from printing
+        the same line a second time: one announcement per session per run.
+        """
+        with self._announce_lock:
+            for sid in session_ids:
+                self._announced.add(str(sid or "").strip())
+
+    def announce_session(self, session_id: str) -> str:
+        """Resolve this session's code and print it before any stage runs.
+
+        Returns the code so the caller can hand the same value to the header
+        that follows. Every surface afterwards reads ``session_codes``, so a
+        single resolution is what the whole run shows.
+
+        A session is announced once per run. Stage 1 asks again before it
+        prints its header, and a line repeated with the same code reads as two
+        runs.
+        """
+        code = self.session_codes.resolve(session_id)
+        key = str(session_id or "").strip()
+        with self._announce_lock:
+            if key in self._announced:
+                return code
+            self._announced.add(key)
+        self._print(session_code_line(code))
+        return code
 
     def _log_summary(self, stage: str, session: str, counts: dict[str, int],
                     chatset: int | None = None) -> None:
@@ -480,6 +618,10 @@ class Engine:
         Returns True when the stage is DONE (or cleanly SKIPPED).
         """
         sid, n = cs.session_id, cs.set_number
+        # Resolved at selection, pinned for the run. This is a read from the
+        # run's own map, not a second lookup: the logger, the debug event and
+        # the progress header below all take this same value.
+        ses_code = self.session_codes.resolve(sid)
         cur = self.ck.cs_stage(sid, n, stage)
         if cur["status"] == DONE:
             if self.force:
@@ -511,7 +653,7 @@ class Engine:
 
         self._print(progress.telemetry_header(
             stage, sid, cs.source_chunk_id or n, payload_chars_in,
-            model, provider))
+            model, provider, session_code=ses_code))
 
         t0 = time.monotonic()
         spinner_label = f"{stage} {sid} CS{cs.source_chunk_id or n} {model}"
@@ -523,7 +665,9 @@ class Engine:
         # two lines per stage and the spinner froze on "✓" even for failures.
         timer = progress.StageTimer(stage, sid, cs.source_chunk_id or n,
                                     cs.chars, model=model,
-                                    model_fn=lambda: self.client.model_for(stage))
+                                    model_fn=lambda: self.client.model_for(stage),
+                                    out_dir=self.out,
+                                    session_code=ses_code)
         timer.start()
         self._stage_timer = timer
 
@@ -594,6 +738,8 @@ class Engine:
             verdict=_verdict_label(gate),
             status=_stage_status,
             detail=(gate.first_reason() if not is_done(gate) else ""),
+            session=sid,
+            out_dir=self.out,
         ))
 
         latency = (time.monotonic() - t0) * 1000
@@ -623,6 +769,8 @@ class Engine:
                     "stage": stage,
                     "status": status_map.get(status, status),
                     "session_id": sid,
+                    "session_code": ses_code,
+                    "stage_code": short_codes.stage_code(stage, n),
                     "chatset_number": n,
                     "chatset_id": cs.chatset_id,
                     "chars_in": cs.chars,
@@ -630,6 +778,8 @@ class Engine:
                     "tokens": rec.total_tokens,
                     "prompt_tokens": rec.prompt_tokens,
                     "completion_tokens": rec.completion_tokens,
+                    "cache_hit_tokens": rec.cache_hit_tokens,
+                    "cache_miss_tokens": rec.cache_miss_tokens,
                     "latency_ms": round(rec.latency_ms, 1),
                     "attempts": safe(rec.attempts if rec.attempts else [{"attempt": 1, "model": rec.model or "unknown"}]),
                     "errors": rec.error or (gate.errors if gate.errors else gate.reasons) if not is_done(gate) else "",
@@ -929,12 +1079,16 @@ class Engine:
             f"  Total session: {total_chars:,} character(s) across "
             f"{len(jobs)} chatset(s)")
 
-        # Print session headers
+        # Print session headers. The code is the run's resolved value, and the
+        # one-line announcement above it is what an operator writes down when
+        # the run starts.
         for sid in sorted(session_jobs.keys()):
             s_jobs = session_jobs[sid]
             cs0 = s_jobs[0]
             total_sets = cs0.total_sets or len(s_jobs)
-            self._print(progress.session_header(sid, total_sets))
+            ses_code = self.announce_session(sid)
+            self._print(progress.session_header(sid, total_sets,
+                                                session_code=ses_code))
 
         progress.stage_clock_reset()
         label = "STAGE 1 (FORCE)" if self.force else "STAGE 1: INGESTION"
@@ -1015,6 +1169,10 @@ class Engine:
                                                      for v in ck_data.values())
                                        and ck_data else "running"),
                             "session_id": sid,
+                            # Read from the run's map, never resolved here:
+                            # this event and the per-stage events must carry
+                            # one code for the session.
+                            "session_code": self.session_codes.code(cs.session_id),
                             "chatset_number": n,
                             "chatset_id": cs.chatset_id,
                             "chars_in": cs.chars,
@@ -1454,6 +1612,50 @@ def _pause(prompt: str = "\n  Press Enter to continue...") -> None:
         pass
 
 
+def select_sessions(sessions: list[Session],
+                    only: tuple[str, int] | list[tuple[str, int]] | None = None
+                    ) -> list[str]:
+    """Session ids this run will touch, in a stable order.
+
+    ``--only`` narrows the run to the sessions it names; without it the run
+    touches the sessions it was given. Resolving codes only for these keeps a
+    number from being minted for a session that never runs.
+    """
+    if only:
+        pairs = ([only] if (isinstance(only, tuple) and len(only) == 2
+                            and isinstance(only[0], str)) else list(only))
+        wanted = {str(p[0]) for p in pairs}
+        # Only sessions this run actually holds. A name in --only that the
+        # source did not yield selects nothing, and a code minted for it would
+        # be a permanent number spent on a run that never touched it.
+        return sorted(s.session_id for s in sessions if s.session_id in wanted)
+    return sorted(s.session_id for s in sessions)
+
+
+def resolve_session_codes(sessions: list[Session],
+                          only: tuple[str, int] | list[tuple[str, int]] | None = None
+                          ) -> dict[str, str]:
+    """One short code per selected session, resolved at selection.
+
+    ``run_engine.py`` calls this before it prints anything and passes the
+    mapping to ``run``. This is the fallback for a caller that enters through
+    ``run`` directly: it resolves at exactly the same point (selection, before
+    ``Engine`` exists), so a run still performs one lookup per session and
+    never resolves again inside a stage.
+
+    A session whose code cannot be resolved is left out; ``SessionCodes``
+    fills it with ``unknown`` on first ask, the same degradation the logger
+    and the display already use.
+    """
+    codes: dict[str, str] = {}
+    for sid in select_sessions(sessions, only):
+        try:
+            codes[sid] = short_codes.code_for(sid)
+        except Exception:  # noqa: BLE001 - a code never stops a run
+            continue
+    return codes
+
+
 def run(sessions: list[Session], *, out_dir: Path,
         client: MachineTask if False else MachineTalkClient,
         workers: int = 4, from_stage: str | None = None,
@@ -1465,7 +1667,9 @@ def run(sessions: list[Session], *, out_dir: Path,
         max_chatsets: int | None = None,
         step_mode: bool = False,
         stage: str | None = None,
-        granular: bool = False) -> int:
+        granular: bool = False,
+        session_codes: dict[str, str] | None = None,
+        announced: bool = False) -> int:
     # One SOMA database per chat session. If --only targets a single
     # session, use that session's database even when the queue has more.
     target_session = None
@@ -1482,10 +1686,24 @@ def run(sessions: list[Session], *, out_dir: Path,
     else:
         soma_file = Path(out_dir) / "soma.json"
 
+    # Selection: one resolution per session, before the Engine exists and
+    # before any stage can print. The codes are pinned into the run so the
+    # logger, the debug event and the progress header read this mapping
+    # rather than resolving again. A caller that already holds the codes (a
+    # launcher that printed them) may pass them in; that is not a lookup.
+    if session_codes is None:
+        session_codes = resolve_session_codes(sessions, only)
+
     eng = Engine(out_dir=out_dir, client=client, workers=workers,
                  quiet=quiet, force=force, gateway_map=gateway_map,
                  debug_dir=debug_dir, max_chatsets=max_chatsets,
-                 step_mode=step_mode, soma_path=soma_file)
+                 step_mode=step_mode, soma_path=soma_file,
+                 session_codes=session_codes, announced=announced)
+    if not announced and not quiet:
+        # Announce at selection, before the first stage. A caller that already
+        # printed the lines passes announced=True and nothing is repeated.
+        for sid in session_codes:
+            eng.announce_session(sid)
     if stage:
         # Accept a comma-separated list so a strict isolation run can execute
         # a prefix of the pipeline (e.g. "distiller,introbeaver") without

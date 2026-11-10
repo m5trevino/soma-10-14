@@ -74,6 +74,60 @@ def _query_int(path: str, key: str, default: int) -> int:
         return default
 
 
+# ── Stage rows ──────────────────────────────────────────────────────────
+
+ROW_KEY_SEP = ":"
+MISSING_CELL = "-"
+
+
+def row_key(event: Dict[str, Any] | None) -> str:
+    """Row key for one stage event: ``session_code`` + ":" + ``stage_code``.
+
+    Re-reading the same JSONL therefore replaces a row instead of appending a
+    duplicate. Events written before TB-OBS-005 carry neither code; those fall
+    back to the chatset and stage they were keyed on before, so an older line
+    still gets its own stable key. ``rowKey()`` in the page is the same rule.
+    """
+    e = event if isinstance(event, dict) else {}
+    session_code = e.get("session_code")
+    stage_code = e.get("stage_code")
+    if session_code and stage_code:
+        return f"{session_code}{ROW_KEY_SEP}{stage_code}"
+    set_key = e.get("chatset_id") or (
+        f"{e.get('session_id') or ''}{ROW_KEY_SEP}{e.get('chatset_number') or ''}")
+    return f"{set_key}{ROW_KEY_SEP}{e.get('stage') or ''}"
+
+
+def stage_rows(events: List[Any]) -> List[Dict[str, Any]]:
+    """Collapse events to one row per key, the last read winning.
+
+    A JSONL line can parse to something that is not an event object; those
+    lines are dropped rather than becoming a row with nothing in it.
+    """
+    rows: Dict[str, Dict[str, Any]] = {}
+    for event in events:
+        if isinstance(event, dict):
+            rows[row_key(event)] = event
+    return list(rows.values())
+
+
+def load_event_rows(path: Path) -> List[Dict[str, Any]]:
+    """Read one JSONL file into stage rows, skipping unreadable lines."""
+    events: List[Dict[str, Any]] = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    except OSError:
+        pass
+    return stage_rows(events)
+
 
 def append_event(event: Dict[str, Any]) -> None:
     """Called by the pipeline when each stage call completes."""
@@ -1613,6 +1667,23 @@ code { font-family: var(--mono); color: var(--amber); }
           </td></tr>
         </tbody>
       </table>
+      <div class="console">
+        <div class="console-head">
+          <span>STAGE TELEMETRY</span>
+          <span class="console-sub">one row per code · last read wins</span>
+        </div>
+        <table class="sessions-table">
+          <thead>
+            <tr><th>Code</th><th>Status</th><th>Cache Hit</th><th>Cache Miss</th></tr>
+          </thead>
+          <tbody id="stages-body">
+            <tr><td colspan="4" class="empty-state">
+              <div class="icon"></div>
+              <p>No stage events recorded.</p>
+            </td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </section>
 
@@ -1680,6 +1751,17 @@ function esc(v) {
 function num(v, fallback) {
   const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : (fallback || 0);
+}
+function cell(v) {
+  return (v === undefined || v === null || v === '') ? '-' : String(v);
+}
+// Same rule as row_key() in the Python module: session_code + ':' + stage_code.
+// Events older than TB-OBS-005 have no codes; they fall back to the chatset and
+// stage they were already keyed on so re-reading the JSONL still replaces.
+function rowKey(e) {
+  if (e && e.session_code && e.stage_code) return e.session_code + ':' + e.stage_code;
+  const setKey = (e && e.chatset_id) || ((e && e.session_id ? e.session_id : '') + ':' + (e && e.chatset_number !== undefined && e.chatset_number !== null ? e.chatset_number : ''));
+  return setKey + ':' + (e && e.stage ? e.stage : '');
 }
 function flashLink() {
   const lamp = document.getElementById('link-lamp');
@@ -2030,9 +2112,49 @@ async function loadSessions() {
   }
 }
 
+// ── Stage rows ────────────────────────────────────────────────────
+// One row per session_code:stage_code, so re-reading the same JSONL replaces
+// a row instead of appending a duplicate. It re-groups the events the page
+// already holds; it does not fetch anything of its own.
+function renderStageRows() {
+  const tbody = document.getElementById('stages-body');
+  if (!tbody) return;
+  const seen = {};
+  events.forEach(e => {
+    if (!e || !e.stage) return;
+    seen[rowKey(e)] = e;   // last read wins
+  });
+  const list = Object.values(seen).sort((a, b) => {
+    const ka = (a.session_code || '') + ':' + (a.stage_code || '');
+    const kb = (b.session_code || '') + ':' + (b.stage_code || '');
+    return ka < kb ? -1 : ka > kb ? 1 : 0;
+  });
+  if (list.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="4" class="empty-state">
+      <div class="icon"></div>
+      <p>No stage events recorded.</p>
+    </td></tr>`;
+    return;
+  }
+  tbody.innerHTML = list.map(e => {
+    const code = (e.session_code && e.stage_code)
+      ? `${e.session_code}:${e.stage_code}`
+      : e.stage_code || e.stage || '-';
+    const st = (e.status || '').toLowerCase();
+    const statusLabel = e.status ? String(e.status).charAt(0).toUpperCase() + String(e.status).slice(1) : '-';
+    return `<tr>
+      <td><span class="session-id">${esc(code)}</span></td>
+      <td>${st ? `<span class="status-dot ${esc(st)}"></span>` : ''}${esc(statusLabel)}</td>
+      <td>${esc(cell(e.cache_hit_tokens))}</td>
+      <td>${esc(cell(e.cache_miss_tokens))}</td>
+    </tr>`;
+  }).join('');
+}
+
 function refreshAll() {
   renderOrbs();
   loadSessions();
+  renderStageRows();
   updateHeader();
 }
 
@@ -2042,6 +2164,7 @@ es.onmessage = e => {
   try {
     events.push(JSON.parse(e.data));
     renderOrbs();
+    renderStageRows();
     updateHeader();
     flashLink();
   } catch (x) {}
@@ -2061,6 +2184,7 @@ fetch('/data').then(r => r.json()).then(d => {
   events = (d && d.events) ? d.events : [];
   eventCount = (d && typeof d.total === 'number') ? d.total : events.length;
   renderOrbs();
+  renderStageRows();
   updateHeader();
 }).catch(() => {});
 
@@ -2079,6 +2203,7 @@ setInterval(() => {
   }).catch(() => {});
   if (document.getElementById('tab-sessions').classList.contains('active')) {
     loadSessions();
+    renderStageRows();
   }
 }, 3000);
 
@@ -2096,6 +2221,7 @@ tickClock();
 // Initial load
 renderOrbs();
 loadSessions();
+renderStageRows();
 updateHeader();
 </script>
 </body>

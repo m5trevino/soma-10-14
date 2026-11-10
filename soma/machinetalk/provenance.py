@@ -42,6 +42,11 @@ class ProvenanceReport:
     # Real text found more than once: verified, but the exact position is a
     # best guess. Kept separate from `issues` because it is not fabrication.
     ambiguous: list[str] = field(default_factory=list)
+    # The entries that survived, with their offsets filled in. Callers that
+    # report on the stage need the accepted set, not just how many passed:
+    # a count alone cannot say whether the two surviving entries were both
+    # directives or one constraint.
+    accepted: list[dict] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -182,6 +187,7 @@ def verify_entries(raw_chat_set: list[dict], entries: list[dict],
         if fill_offsets:
             entry["char_start"], entry["char_end"] = span
         report.verified += 1
+        report.accepted.append(entry)
         repeats = _count_matches(text, source)
         if repeats > 1:
             report.ambiguous.append(

@@ -153,6 +153,12 @@ def resolve_sessions_from_ids(session_ids: list[str]) -> list[str]:
     for sid in session_ids:
         if not sid:
             continue
+        # Exact path first: a consolidated session (lineage/consolidated/<key>)
+        # must not be shadowed by a same-named source session under the vault.
+        exact = Path(sid)
+        if exact.is_dir():
+            resolved.append(str(exact))
+            continue
         dir_name = sid.split("/")[-1]
         candidate = vault / dir_name
         if candidate.exists():

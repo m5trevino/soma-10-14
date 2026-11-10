@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import http.client
 import inspect
+import json
 import os
 import sys
 import time
@@ -52,6 +53,36 @@ _STAGE_MAP = {
 }
 
 
+def _int_metric(value: Any) -> int:
+    """Coerce a provider-reported counter to int, or 0 when it is unusable.
+
+    Providers differ: some omit the cache keys, some send null. Telemetry
+    must never be the reason a call fails, so anything unreadable is 0.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _messages_chars(messages: Any) -> int:
+    """Total characters of the outgoing message contents.
+
+    Measured from the messages themselves, before the request is sent, so a
+    provider that reports nothing still leaves a size on the record. Only a
+    count is kept; the text itself never goes onto the usage record.
+    """
+    if not isinstance(messages, list):
+        return 0
+    total = 0
+    for msg in messages:
+        if isinstance(msg, dict):
+            content = msg.get("content")
+            if isinstance(content, str):
+                total += len(content)
+    return total
+
+
 @dataclass
 class CallRecord:
     stage: str = ""
@@ -65,6 +96,9 @@ class CallRecord:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    chars_in: int = 0
     latency_ms: float = 0.0
     error: str = ""
     raw_response: str = ""
@@ -83,6 +117,9 @@ class StageResult:
         completion_tokens: int = 0,
         total_tokens: int = 0,
         latency_ms: float = 0.0,
+        cache_hit_tokens: int = 0,
+        cache_miss_tokens: int = 0,
+        chars_in: int = 0,
     ) -> None:
         self.content = content
         self.model_id = model_id
@@ -90,6 +127,86 @@ class StageResult:
         self.completion_tokens = completion_tokens
         self.total_tokens = total_tokens
         self.latency_ms = latency_ms
+        self.cache_hit_tokens = cache_hit_tokens
+        self.cache_miss_tokens = cache_miss_tokens
+        self.chars_in = chars_in
+
+
+class ProfileError(RuntimeError):
+    """The deck file is absent, unreadable, or not a profile.
+
+    A run whose deck is wrong cannot be interpreted afterwards, so this is
+    raised rather than defaulted: there is no correct deck to guess.
+    """
+
+
+def describe_deck(profile_path: str | Path) -> dict:
+    """Describe the deck a profile loads, read-only.
+
+    Returns ``{"path", "name", "models", "stages", "stages_pinned"}``.
+    ``models`` is the number of cards the profile puts in play and ``stages``
+    names them, so a log line says which deck produced a run instead of only
+    which file was named.
+
+    Raises ProfileError if the path is unset, missing, unreadable, not JSON,
+    or not a JSON object. Nothing is written and no model is selected here.
+    """
+    if not profile_path:
+        raise ProfileError(
+            "TurnKey profile path is not set: no deck can be described")
+
+    path = Path(profile_path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ProfileError(f"TurnKey profile not found: {path}") from exc
+    except OSError as exc:
+        raise ProfileError(
+            f"TurnKey profile is unreadable: {path}: {exc}") from exc
+
+    try:
+        profile = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ProfileError(
+            f"TurnKey profile is not valid JSON: {path}: {exc}") from exc
+
+    if not isinstance(profile, dict):
+        raise ProfileError(
+            f"TurnKey profile root is not a JSON object: {path}")
+
+    deck = profile.get("deck")
+    if not isinstance(deck, list):
+        # Peacock-era profiles list their cards under "attempts".
+        deck = profile.get("attempts")
+    if not isinstance(deck, list):
+        raise ProfileError(
+            f"TurnKey profile has no 'deck' or 'attempts' list: {path}")
+
+    raw_stages = profile.get("stages")
+    stages: list[str] = []
+    pinned = 0
+    if isinstance(raw_stages, list):
+        for entry in raw_stages:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("stageName") or entry.get("stage") or ""
+            if name:
+                stages.append(str(name))
+            if entry.get("pinnedModels"):
+                pinned += 1
+    elif isinstance(raw_stages, dict):
+        for name, entry in raw_stages.items():
+            stages.append(str(name))
+            if isinstance(entry, dict) and entry.get("pinnedModels"):
+                pinned += 1
+
+    return {
+        "path": str(path),
+        "name": str(profile.get("name") or ""),
+        "models": len(deck),
+        "stages": stages,
+        "stages_pinned": pinned,
+    }
 
 
 class TurnKeyClient:
@@ -97,6 +214,12 @@ class TurnKeyClient:
 
     def __init__(self, profile_path: str) -> None:
         self._profile_path = profile_path
+        # Describe the deck before the SDK loads it: the line must exist even
+        # if the deck turns out to be unusable, and a bad path is fatal here
+        # with the path in the message rather than deep inside the SDK.
+        self._deck = describe_deck(profile_path)
+        print(f"deck: {self._deck['path']}  models={self._deck['models']}  "
+              f"stages_pinned={self._deck['stages_pinned']}", flush=True)
         self._sdk = self._load_sdk(profile_path)
         self._pea_kw = self._supports_pea_session(self._sdk.run_stage)
 
@@ -126,6 +249,9 @@ class TurnKeyClient:
              pea_session: str | None = None,
              temperature: float | None = None) -> StageResult:
         mapped = _STAGE_MAP.get(stage, stage)
+        # Size is measured before the request leaves, so it is available even
+        # when the provider reports no usage block at all.
+        chars_in = _messages_chars(messages)
         start = time.monotonic()
         kwargs = {"pea_session": pea_session} if self._pea_kw else {}
         # run_stage only sends temperature when it is not None, so passing it
@@ -141,6 +267,8 @@ class TurnKeyClient:
             content = choices[0].get("message", {}).get("content", "") or ""
 
         usage = raw.get("usage", {}) if isinstance(raw, dict) else {}
+        if not isinstance(usage, dict):
+            usage = {}
         return StageResult(
             content=content,
             model_id=raw.get("model", "unknown") if isinstance(raw, dict) else "unknown",
@@ -148,6 +276,11 @@ class TurnKeyClient:
             completion_tokens=usage.get("completion_tokens", 0),
             total_tokens=usage.get("total_tokens", 0),
             latency_ms=elapsed,
+            # DeepSeek and Qwen report prefix-cache accounting here; other
+            # providers omit it. Absent or unreadable is 0, never a raise.
+            cache_hit_tokens=_int_metric(usage.get("prompt_cache_hit_tokens", 0)),
+            cache_miss_tokens=_int_metric(usage.get("prompt_cache_miss_tokens", 0)),
+            chars_in=chars_in,
         )
 
     def chat(self, messages: list[dict[str, str]], **kwargs: Any) -> StageResult:
@@ -243,8 +376,6 @@ class EngineClient:
                               f"stopping after {attempt + 1} attempt(s)",
                               file=sys.stderr, flush=True)
                         raise
-                if attempt + 1 < attempts:
-                    time.sleep(1.5 * (attempt + 1))
             except Exception as exc:
                 # SDKError and anything else — also retry to rotate the deck
                 last = exc
@@ -258,8 +389,6 @@ class EngineClient:
                               f"stopping after {attempt + 1} attempt(s)",
                               file=sys.stderr, flush=True)
                         raise
-                if attempt + 1 < attempts:
-                    time.sleep(1.5 * (attempt + 1))
         assert last is not None
         raise last
 
@@ -282,7 +411,7 @@ class EngineClient:
         allowed into the graph unverified.
         """
         from .fleet import assemble
-        from .gate import validate, is_done, is_hard_block
+        from .gate import summarize, validate, is_done, is_hard_block
         from .provenance import (verify_distiller, verify_introbeaver)
 
         # The engine names the PEA directory itself: start time plus this
@@ -326,6 +455,11 @@ class EngineClient:
                 gate.errors.extend(str(i) for i in prov.issues)
                 gate.ok = False
                 gate.provenance = prov.summary()
+            if prov is not None:
+                # The counts must describe the entries that survived the
+                # check. The model's arrays still contain the rejected ones,
+                # so counting the payload here would overstate the stage.
+                gate.accomplishment_summary = summarize(gate, prov.accepted)
 
         rec = CallRecord(
             stage=stage,
@@ -339,6 +473,9 @@ class EngineClient:
             prompt_tokens=result.prompt_tokens,
             completion_tokens=result.completion_tokens,
             total_tokens=result.total_tokens,
+            cache_hit_tokens=result.cache_hit_tokens,
+            cache_miss_tokens=result.cache_miss_tokens,
+            chars_in=result.chars_in,
             latency_ms=result.latency_ms,
             raw_response=result.content,
             sys_prompt=sys_prompt,

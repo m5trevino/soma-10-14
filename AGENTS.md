@@ -5,15 +5,12 @@
 
 # READ FIRST
 
-`GROUND_TRUTH.md` in this directory is required reading before any change to
-this project. It records what the pipeline is *designed* to do (declared in
-`soma/soma_template.sql`) versus what the running code currently does, and it
-lists five invariants that must not be broken.
+Instructions for each stage live in the `stage_instructions` table and are read
+at runtime by `soma/machinetalk/client.py:call_stage` via
+`soma.get_stage_instruction(stage)`. The markdown under `soma/machine-talk/` is
+an input to `build_soma_template.py`, not a runtime source. Do not change a
+stage's behaviour by editing prompt files or by concatenating extra context into
+the request.
 
-The short version: instructions live in the `stage_instructions` table and each
-stage reads its own view. The running code instead reads markdown from disk and
-concatenates it into a chat message. That is a regression, not the design. Do
-not "fix" the pipeline by improving prompts.
-
-If a proposed change breaks an invariant in `GROUND_TRUTH.md`, stop and say so
-rather than proceeding.
+A stage's output is validated by Python in `soma/machinetalk/gate.py` before it
+is trusted. The model is never the gate. Do not move a decision into the prompt.

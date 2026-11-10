@@ -4,7 +4,12 @@ Every stage start/work/complete/failure is logged to:
   - stdout (CLI notification)
   - CWD/<timestamp>_pipeline.log (master chronological log)
   - CWD/<stage>.log (per-stage append log)
-  - <out>/logs/<stage>/<session>.log (per-session per-stage detail)
+  - <out>/logs/<stage>/<SES-NNN>_<ST-NN>.log (per-session per-stage detail)
+
+The session sink is named by short code -- ``SES-001_DI-01.log`` -- and each
+line in it carries the same codes as a ``[SES-001][DI-01] `` prefix, so an
+operator can grep a run by either code without decoding a uuid. The master
+log and the per-stage CWD log keep their long-standing names and plain lines.
 
 This ensures operators can watch live progress AND review historical
 logs from any run, without hunting through subdirectories.
@@ -16,7 +21,16 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import short_codes
+
 LOG_LOCK = threading.Lock()
+
+#: Label used when a session or stage code cannot be resolved. Logging must
+#: never take the run down, so an unresolvable code degrades to this.
+UNKNOWN_CODE = "unknown"
+
+#: The session sink records one file per stage, not per turn.
+STAGE_TURN = 1
 
 
 def _ts() -> str:
@@ -51,14 +65,50 @@ def _write_to(path: Path, line: str) -> None:
             f.flush()
 
 
+def _session_code(session_id: str, codes=None) -> str:
+    """Short code for a session, or ``unknown`` when it cannot be resolved.
+
+    ``codes`` is the run's resolver (``engine.SessionCodes``). When the run
+    resolved the code at selection, the logger reads that same value instead
+    of asking the store again, so the sink filename and the screen cannot
+    disagree. Without a resolver this still resolves its own, which keeps
+    direct ``StageLogger`` users working.
+
+    ``code_for`` mints on first use and raises on an empty id or a corrupt
+    store. A log line is never worth failing a run over, so every failure
+    here degrades to a literal ``unknown`` that is still greppable.
+    """
+    if codes is not None:
+        try:
+            return codes.resolve(session_id)
+        except Exception:  # noqa: BLE001 - logging must not raise
+            return UNKNOWN_CODE
+    try:
+        return short_codes.code_for(session_id)
+    except Exception:  # noqa: BLE001 - logging must not raise
+        return UNKNOWN_CODE
+
+
+def _stage_code(stage: str) -> str:
+    """Short code for a stage's single turn, or ``unknown`` for odd stages."""
+    try:
+        return short_codes.stage_code(stage, STAGE_TURN)
+    except Exception:  # noqa: BLE001 - logging must not raise
+        return UNKNOWN_CODE
+
+
 class StageLogger:
     """Thread-safe logger: console + cwd master log + per-stage logs."""
 
     def __init__(self, *, cwd: Path | None = None, out_dir: Path | None = None,
-                 quiet: bool = False) -> None:
+                 quiet: bool = False, session_codes=None) -> None:
         self.cwd = Path(cwd or Path.cwd()).resolve()
         self.out_dir = Path(out_dir or self.cwd / "pipeline_out").resolve()
         self.quiet = quiet
+        # The run's resolved session codes, when the engine has them. Held
+        # here so every line and every sink filename in the run reads one
+        # value rather than resolving again.
+        self.session_codes = session_codes
         self._master_log = self.cwd / f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_pipeline.log"
 
     # -- public API --------------------------------------------------------
@@ -165,7 +215,9 @@ class StageLogger:
         # Per-stage log in CWD
         stage_log = self.cwd / f"{stage.lower()}.log"
         _write_to(stage_log, line)
-        # Per-session per-stage log in out_dir
-        sid = session_id or (msg.split("session=")[1].split(" ")[0] if "session=" in msg else "unknown")
-        session_log = self.out_dir / "logs" / stage.lower() / f"{sid}.log"
-        _write_to(session_log, line)
+        # Per-session per-stage log in out_dir, named by short code
+        sid = session_id or (msg.split("session=")[1].split(" ")[0] if "session=" in msg else "")
+        ses = _session_code(sid, self.session_codes)
+        stg = _stage_code(stage)
+        session_log = self.out_dir / "logs" / stage.lower() / f"{ses}_{stg}.log"
+        _write_to(session_log, f"[{ses}][{stg}] {line}")

@@ -49,6 +49,10 @@ class GateResult:
     exfil_type: str = ""
     signal_quality: str = ""
     provenance: str = ""           # provenance check summary, when run
+    # What actually happened, in one line, for the operator: entries accepted
+    # on a pass, or the reason nothing was. Reporting only — it is derived
+    # from the structured payload and never feeds back into ``ok``.
+    accomplishment_summary: str = ""
 
     @property
     def reasons(self) -> str:
@@ -145,6 +149,157 @@ def _find_all(obj: Any, key: str) -> list[Any]:
         for v in obj:
             out.extend(_find_all(v, key))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Accomplishment summary
+# ---------------------------------------------------------------------------
+#
+# One line saying what the stage actually put on the record, so an operator
+# does not have to open the artifact to learn whether a pass carried anything.
+# It is reporting only: it is computed from the structured payload and the
+# gate's own outcome, and nothing downstream reads it to decide anything.
+
+# (payload list, singular noun) in the order a reader wants them.
+_DISTILLER_LISTS = (("directives", "directive"),
+                    ("constraints", "constraint"),
+                    ("preferences", "preference"),
+                    ("questions", "question"),
+                    ("corrections", "correction"),
+                    ("confirmations", "confirmation"),
+                    ("artifacts", "artifact"))
+
+# (instruction_type, singular noun) for the introbeaver's entries[].
+_INTROBEAVER_TYPES = (("DIRECTIVE", "directive"),
+                      ("CONSTRAINT", "constraint"),
+                      ("PREFERENCE", "preference"),
+                      ("QUESTION", "question"))
+
+# Verdict encodings that mean "proceed", not a result worth naming.
+_NO_VERDICT = frozenset({"false", "true", "0", "no", "yes", ""})
+
+
+def _plural(n: int, singular: str, plural: str) -> str:
+    return f"{n} {singular if n == 1 else plural}"
+
+
+def _join_counts(counts: list[tuple[str, int, str]]) -> str:
+    """``3 directives, 1 constraint`` from (key, n, singular) triples."""
+    parts = [_plural(n, singular, f"{singular}s")
+             for _, n, singular in counts if n]
+    return ", ".join(parts)
+
+
+def _payload_body(parsed: Any, stage: str) -> dict:
+    """The stage's own wrapper object, else the payload itself."""
+    if not isinstance(parsed, dict):
+        return {}
+    wrapped = parsed.get(f"{stage}_output")
+    if isinstance(wrapped, dict):
+        return wrapped
+    body = parsed.get("distiller_output") or parsed.get("introbeaver_output")
+    return body if isinstance(body, dict) else parsed
+
+
+def _distiller_counts(body: dict, verified: list[dict] | None
+                      ) -> list[tuple[str, int, str]]:
+    """Per-list accepted counts.
+
+    ``verified`` is what survived the provenance check. When it is supplied,
+    only those entries are counted: the model's array is a claim, and the
+    summary must describe what was actually accepted, not what was emitted.
+    Without it (a stage called outside the provenance path) the payload's
+    lists are all there is to count.
+    """
+    known = {key: singular for key, singular in _DISTILLER_LISTS}
+    if verified is None:
+        return [(key, len([e for e in (body.get(key) or []) if isinstance(e, dict)]),
+                 singular)
+                for key, singular in _DISTILLER_LISTS]
+
+    tallies: dict[str, int] = {}
+    for entry in verified:
+        if not isinstance(entry, dict):
+            continue
+        # ``verify_distiller`` stamps ``directives[0]``-style ids, which is
+        # the only record of which emitted list the entry came from.
+        key = str(entry.get("entry_id") or "").split("[", 1)[0]
+        if key in known:
+            tallies[key] = tallies.get(key, 0) + 1
+    return [(key, tallies.get(key, 0), singular)
+            for key, singular in _DISTILLER_LISTS]
+
+
+def _introbeaver_counts(body: dict, verified: list[dict] | None
+                        ) -> list[tuple[str, int, str]]:
+    entries = verified if verified is not None else (body.get("entries") or [])
+    tallies: dict[str, int] = {}
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("instruction_type") or "").strip().upper()
+        if kind in dict(_INTROBEAVER_TYPES):
+            tallies[kind] = tallies.get(kind, 0) + 1
+    return [(kind, tallies.get(kind, 0), singular)
+            for kind, singular in _INTROBEAVER_TYPES]
+
+
+def _skip_label(gate: "GateResult") -> str:
+    """Name why the stage stopped, preferring the stage's own token.
+
+    ``NO_INTENT`` is the introbeaver's verdict; the distiller signals a skip
+    with a boolean, so its ``skip_reason`` token (``NO_SIGNAL`` and friends)
+    is the only informative one there.
+    """
+    verdict = gate.verdict.strip()
+    if verdict and verdict.lower() not in _NO_VERDICT:
+        return verdict
+    reason = gate.skip_reason.strip()
+    if reason:
+        return reason
+    return "true"
+
+
+def summarize(gate: "GateResult", verified: list[dict] | None = None) -> str:
+    """Describe the outcome of a gate in one line.
+
+    The order is the operator's question order: did it stop by design, was it
+    stopped by a gate, did it fail, or did it pass and with what?
+    """
+    if gate.skipped:
+        return f"skipped: {_skip_label(gate)}"
+
+    spec = SPECS.get(gate.stage)
+    if spec is not None and gate.verdict.upper() in spec.block_tokens:
+        return f"blocked: {gate.verdict}"
+
+    # An echoed-hash defect is not a retryable formatting slip: the stage
+    # cannot prove which input it read, so nothing it emitted is trustworthy.
+    for err in gate.errors:
+        if err.startswith(("hash_mismatch", "missing_hash_echo")):
+            return "blocked: hash mismatch"
+        if err.startswith("hash_echo_not_sha256"):
+            return "blocked: hash echo is not a sha256"
+
+    if not gate.ok:
+        return f"failed: {_plural(len(gate.errors), 'gate error', 'gate errors')}"
+
+    body = _payload_body(gate.parsed, gate.stage)
+    if gate.stage == "distiller":
+        counts = _distiller_counts(body, verified)
+    elif gate.stage == "introbeaver":
+        counts = _introbeaver_counts(body, verified)
+    else:
+        counts = []
+    joined = _join_counts(counts)
+    if joined:
+        return joined
+    if counts:
+        return "accepted: 0 entries"
+    verdict = gate.verdict.strip()
+    if verdict and verdict.lower() not in _NO_VERDICT:
+        return f"accepted: {verdict}"
+    return "accepted"
 
 
 # ---------------------------------------------------------------------------
@@ -341,12 +496,22 @@ def _check_scout(raw: str) -> GateResult:
 # ---------------------------------------------------------------------------
 
 def validate(stage: str, raw: str, expected_hash: str | None = None) -> GateResult:
+    """Parse and check one response, and describe the outcome in one line.
+
+    ``accomplishment_summary`` is set here for every path, so a caller can
+    never receive a GateResult with an empty one. Callers that run a
+    provenance check afterwards re-derive it with ``summarize``, so the
+    counts describe accepted entries rather than emitted ones.
+    """
     spec = SPECS.get(stage)
     if spec is None:
-        return GateResult(False, stage, errors=[f"unknown_stage:{stage}"])
-    if spec.text:
-        return _check_scout(raw)
-    return _check_json(stage, spec, raw, expected_hash)
+        result = GateResult(False, stage, errors=[f"unknown_stage:{stage}"])
+    elif spec.text:
+        result = _check_scout(raw)
+    else:
+        result = _check_json(stage, spec, raw, expected_hash)
+    result.accomplishment_summary = summarize(result)
+    return result
 
 
 def is_done(gate: GateResult) -> bool:
